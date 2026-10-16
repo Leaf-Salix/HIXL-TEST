@@ -15,6 +15,10 @@ CPU 使用公开 ACL 同步/异步拷贝，NPU 使用真实 AIV kernel，访问�
 例如 `/usr/local/Ascend/cann-9.0.0/lib64`；本模式不初始化 HIXL，不能记成 HIXL API 传输通过。
 A/B 两机完整命令见 [系统 CANN 共享域测试](docs/node-shared.md)。
 
+判断 DRAM_A→DRAM_B 的实际链路时，使用独立的 [DRAM 路径探针](docs/dram-route.md)：
+不分配 HBM，记录实际地址对的驱动查询，并在排除初始化/校验的窗口采集双方 PCIe/HCCS 流量。
+文档包含 A、B 完整启动、导出和证据汇总命令。
+
 本仓库已执行的检查、SDK 适配及未验证项目见 [验证记录](docs/validation.md)。
 
 **严格验证同机两个 NPU 共用一块 DRAM 时，使用 `--layout node-shared`，见 [共享 DRAM 六窗口测试](docs/node-shared.md)。**

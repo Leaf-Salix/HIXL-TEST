@@ -2,6 +2,15 @@
 
 日期：2026-10-16（Asia/Shanghai）。
 
+## 独立 DRAM 路径探针
+
+新增 [DRAM_A→DRAM_B 路径验证](dram-route.md)，记录实际拷贝 VA 的驱动查询，
+并用 CANN profiling API 对 idle/N/2N 单独采集双方 PCIe/HCCS，排除初始化、预热和 CPU 校验。
+2026-10-16 已经 task-submit 单机两卡验证：1 MiB × 4096/8192 次（4/8 GiB）数据与 guard、
+正常释放全部通过，双方三个阶段的 PCIe/HCCS CSV 和 timeline 均导出成功。
+实际查询 rc=0/raw=0/INNER；这不是逐跳 PCIe/HCCS 路径结论。
+双机路径探针尚待用户运行；其结果与下文已有完整矩阵通过记录分别报告。
+
 ## 单机实测（仓库整理时执行）
 
 环境为单台 Atlas A3、两张独立物理 NPU、CANN 9.0、26.0.rc1 驱动。
