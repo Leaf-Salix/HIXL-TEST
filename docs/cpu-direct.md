@@ -228,8 +228,47 @@ tar -czf "$TEST_ROOT/results/$RUN_ID-evidence.tar.gz" -C "$TEST_ROOT/results" \
 **本次结论是数据校验失败，不是 `UNSUPPORTED`，也不是 `SINGLE_HOST_CPU_PASS`。**
 API 返回成功与实际 CPU 数据访问通过是两项独立条件；前者在本次满足，后者没有满足。
 全窗口校验在首个目标字节中止，未完成四组 READ/WRITE 和 guard 验收，正常清理路径也未走到完成标记。
-日志没有记录该字节的实际值，尚不能据此确定映射、缓存可见性或探针实现中的具体根因。
+首轮日志没有记录该字节的实际值；后续增加诊断和匹配正对照，结果见下节。
 
 本版本尚无通过的同机 CPU 数据访问验收结果；上面的双机命令保留为实验排障入口，不能当作已验证可用流程。
 双机 CPU 原生访问尚未实测；公开实现的拒绝分支不替代你现场安装版本的运行结果。
 本次同机失败也不能证明 CPU 没有物理接入 HCCS，或证明硬件不可能提供跨机访问能力。
+
+### 后续排查：导入 Host 视图与 Device 视图的行为不同
+
+2026-10-16，继续在同一系统 CANN 9.0 环境经 task-submit 预约单卡，两个同机进程绑定同一设备。
+诊断保留原花纹、逐字节 CPU 拷贝和全窗口校验，控制 socket 不传测试载荷；失败后累计错误并完成正常清理。
+以下为独立诊断程序的实测结果，不是原能力探针已经通过。
+
+| 对照 | 实际结果 |
+| --- | --- |
+| 纯 CPU POSIX 共享映射 | 两进程四组 READ/WRITE、完整 2 MiB 窗口与 guard、清理通过；不初始化 ACL/NPU |
+| 同进程同一物理 allocation 的第二个普通 VA | owner→alias 与 alias→owner 的 CPU 写后读均正确 |
+| 原 Fabric 导入流程 | owner Fill 自检通过；首组 peer READ 实际读到 0，期望为 246；本地目标确实被写成 0 |
+| peer WRITE | 导入视图中可本地读回新值，owner 的目标区仍保持原花纹；未形成预期共享语义 |
+| reserve flags=0、owner 显式 HOST 权限、retained handle 导出 | 分别单因素修改，均未修复 CPU 校验 |
+| 导出/导入角色分离 | exporter-only 与 importer-only，交换角色后，DEFAULT（uint64 token）与 FABRIC（128 字节 token）均失败 |
+| 显式 PID 白名单 | 改用 export flags=0，并设置对端 bare PID 白名单，DEFAULT/FABRIC 均未修复 CPU 校验 |
+| CPU cache 维护 | 按 CTR_EL0 的缓存行大小执行 `dc civac` 与 `dsb sy`，没有指令异常，仍出现相同错误 |
+
+为确认共享句柄本身有效，最后原样复用本仓库 DRAM 路径探针的关键映射流程：
+owner Device 权限→retain/export→自身及 peer import→NoUC Device VA。
+**先用 NoUC 视图进行 SDMA 正对照，再为同一个已导入 handle 增加普通 VA 与 HOST READWRITE，
+执行 CPU 四组 READ/WRITE，最后重新初始化花纹并复测原 NoUC SDMA 路径。** 没有为 CPU 视图重复 import token。
+
+| 最终匹配对照 | 无 cache 维护 | 有 cache 维护 |
+| --- | --- | --- |
+| SDMA 前测，64 KiB 搬运及双方完整 4 MiB 校验 | PASS | PASS |
+| CPU 四组 READ/WRITE，双方完整 4 MiB 校验 | FAIL；四组均完成，各自接收方校验失败 | 相同 FAIL |
+| 换新花纹后的 SDMA 后测及双方完整窗口校验 | PASS | PASS |
+| 两端正常卸载、释放及退出码 | cleanup=PASS；均退出 1 | cleanup=PASS；均退出 1 |
+
+CPU 与 SDMA 使用不同花纹和独立校验阶段；SDMA 不补写 CPU 测试结果，也不作为 CPU 成功的回退。
+早期简化 SDMA 参照在同步时返回过 507001，未计入正对照；上表使用完整映射流程后取得的前后通过结果。
+
+**目前故障点收敛到：在这套现场 SDK/驱动及 VMM 调用流程下，导入 handle 的普通 Host VA
+未表现出与 owner DRAM 共享的 CPU 读写语义；同一 handle 的 NoUC Device 视图仍经 SDMA 前后测独立验证有效。**
+已有对照不支持将问题解释成花纹/偏移错误、句柄完全失效，或仅缺少上述 CPU cache 维护。
+SetAccess/GetAccess 的成功也不足以证明真实 CPU 共享访问已建立。
+这仍没有定位到现场驱动的具体缺陷或受支持语义：驱动管理的 IO VMA 未提供可用于本次比较的 pagemap PFN，
+不能据此断言两边物理地址不同。也不能把单机结果写成双机结论，或推断 CPU 未接入 HCCS、硬件不支持。

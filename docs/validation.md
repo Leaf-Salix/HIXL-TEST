@@ -10,8 +10,18 @@
 随后 rank1 因控制连接 Broken pipe 退出。两 rank 均退出 1，零组 `CPU_CASE_PASS`，没有成功清理标记或成功 summary。
 原始产物的 source/session/build 摘要一致，并与 `f12209a` 的探针源码匹配。
 
-该结果记为 **FAIL，不是 UNSUPPORTED 或 CPU 直接访问通过**；根因尚未确定，双机 CPU 原生访问仍未实测。
+该结果记为 **FAIL，不是 UNSUPPORTED 或 CPU 直接访问通过**；双机 CPU 原生访问仍未实测。
 它不改变下文已经通过的 NPU SDMA、AIV 或 HIXL 测试结果，也不能证明硬件没有 CPU-HCCS 连接。
+
+后续单机排查已完成：纯 CPU POSIX 共享映射与同进程物理内存别名正确；跨进程导入窗口的 CPU READ
+读错数据，CPU WRITE 本地可读回但 owner 不变。reserve 参数、显式 Host 权限、retained 导出、
+角色分离、DEFAULT/FABRIC 类型和显式 PID 白名单对照均未修复，CPU cache 维护也未改变结果。
+
+最终复用已验证的 DRAM 映射流程，对同一导入 handle 的 NoUC Device 视图与新增普通 Host 视图进行匹配对照。
+有无 cache 维护两组均为 **SDMA 前测 PASS → CPU 四组 FAIL → 换新花纹的 SDMA 后测 PASS → cleanup PASS**；
+双方每阶段检查完整 4 MiB 窗口，CPU/SDMA 搬运区均为 64 KiB，两端因 CPU 数据失败退出 1。
+该证据将问题收敛到当前 SDK/驱动下导入 Host 视图的建立或适用语义，未定位具体驱动缺陷，
+不能推断物理地址不同或硬件不支持。各项对照及边界见 [CPU 访问排查记录](cpu-direct.md#后续排查导入-host-视图与-device-视图的行为不同)。
 
 ## 独立 DRAM 路径探针
 
