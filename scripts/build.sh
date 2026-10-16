@@ -10,12 +10,11 @@ hixl_include=${HIXL_INCLUDE_DIR:-$ASCEND_HOME_PATH/include}
 hixl_lib=${HIXL_LIB_DIR:-$ASCEND_HOME_PATH/lib64}
 compiler=${CXX:-g++}
 mkdir -p "$root/build"
-if [[ -d "$root/.ccache" ]]; then
-  export CCACHE_DIR="$root/.ccache"
-  ccache -s
-fi
 prefix=()
 if command -v ccache >/dev/null; then
+  export CCACHE_DIR="$root/.ccache"
+  mkdir -p "$CCACHE_DIR"
+  ccache -s
   prefix=(ccache)
 fi
 "${prefix[@]}" "$compiler" -std=c++17 -O2 -g -Wall -Wextra -Werror \

@@ -19,8 +19,9 @@ if [[ ! -f "$source_dir/include/hixl/experimental_domain_window.h" ]]; then
 fi
 out="$root/build/domain"
 mkdir -p "$out/lib"
-if [[ -d "$source_dir/.ccache" ]]; then
+if command -v ccache >/dev/null; then
   export CCACHE_DIR="$source_dir/.ccache"
+  mkdir -p "$CCACHE_DIR"
   ccache -s
 fi
 export CMAKE_BUILD_PARALLEL_LEVEL=4
