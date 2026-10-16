@@ -11,9 +11,13 @@
 
 本仓库已执行的检查、SDK 适配及未验证项目见 [验证记录](docs/validation.md)。
 
+**严格验证同机两个 NPU 共用一块 DRAM 时，使用 `--layout node-shared`，见 [共享 DRAM 六窗口测试](docs/node-shared.md)。**
+该选项在双机各两卡时只分配两块 DRAM 和四块 HBM，显式覆盖六个计算参与者对六个位置的读写，
+并增加同址有序交接、同轮读同一区域和写不同子区间。新布局单机已通过，双机新矩阵尚待实测。
+
 ## 测什么
 
-每个进程绑定一张 NPU，并拥有两个 2 MiB 窗口：真实 Host DRAM 和本地 HBM。
+默认 `--layout rank-private`：每个进程绑定一张 NPU，并拥有两个 2 MiB 窗口：真实 Host DRAM 和本地 HBM。
 CPU 直接初始化/校验自己的 DRAM；访问其他空间通过 HIXL 域操作。
 NPU kernel 使用真实 AIV MTE（GM→UB→GM）主动访问映射后的所有窗口。
 
@@ -25,10 +29,10 @@ NPU kernel 使用真实 AIV MTE（GM→UB→GM）主动访问映射后的所有�
 | `combined` | 同一组物理窗口的 HIXL、kernel、跨后端交接与生命周期 | 本仓库的可选 beta2 实验桥，见 [实验说明](docs/experimental.md) |
 
 每次操作前更换数据花纹，操作后逐字节检查所有 owner 的完整窗口，包括源和目标区间外 guard。
-测试长度为 4 KiB、64 KiB，源偏移 256 B、目标偏移 512 B。
+测试长度为 4 KiB、64 KiB；默认 rank-private 布局的源偏移为 256 B、目标偏移为 512 B。
 NPU stream、HIXL completion 和 CPU 校验都有实际返回状态检查。
 
-设总 rank 数为 `P`，全局用例数为：
+默认 rank-private 布局中，设总 rank 数为 `P`，全局用例数为（node-shared 使用独立计数）：
 
 | 内容 | 公式 | 2 ranks | 4 ranks（两机各两卡） |
 | --- | --- | --- | --- |

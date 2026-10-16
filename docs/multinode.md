@@ -10,6 +10,9 @@ Host DRAM 访问权限及 CANN/HDK/灵衢版本。普通 RoCE 多机不在该测
 同机两个 rank 的 Host 内存仍是两个独立窗口；可以放在相同或不同 NUMA 节点。
 这验证多个 CPU worker 的参与，不验证 CPU socket 之间的硬件缓存一致性。
 
+严格要求每台机器一块实际 DRAM 由本机两个 NPU 共同访问时，两个节点均添加
+`--layout node-shared`，详见 [共享 DRAM 六窗口测试](node-shared.md)。下文未加该选项的命令仍使用默认 rank-private 布局。
+
 ## 1. 在每个节点准备相同源码和配置
 
 目标节点不必联网。提前传入仓库源码包，在每台机器上使用已安装 SDK 编译。

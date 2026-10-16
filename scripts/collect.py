@@ -21,10 +21,13 @@ def collect(directories):
         if manifest["status"] != "PASS" or manifest["returncodes"] != [0] * len(manifest["ranks"]):
             raise ValueError(f"failed or unfinished result: {directory}")
         current_hashes = manifest["build_info"]["source_sha256"]
-        expected_session = runner.digest(manifest["config"], manifest["mode"], manifest["allocator"])
+        layout = manifest.get("layout", "rank-private")
+        expected_session = runner.digest(manifest["config"], manifest["mode"], manifest["allocator"], layout)
         if manifest["session"] != expected_session:
             raise ValueError("manifest config/session mismatch")
         planned = runner.validate(manifest["config"])
+        if layout == "node-shared" and manifest.get("model") != runner.shared_model(manifest["config"]):
+            raise ValueError("shared allocation model disagrees with configuration")
         if manifest["world"] != len(planned):
             raise ValueError("manifest world/config mismatch")
         if session is None:
@@ -40,7 +43,7 @@ def collect(directories):
                 raise ValueError("duplicate or invalid rank result")
             seen.add(number)
             text = (directory / f"rank-{number}.log").read_text()
-            runner.check_log(text, number, world, mode)
+            runner.check_log(text, number, world, mode, layout, manifest["config"])
             if runner.run_id(text) != group_id:
                 raise ValueError("log/manifest run ID mismatch")
             node = rank["node"]
@@ -54,7 +57,9 @@ def collect(directories):
     if len(set(node_hosts.values())) != len(node_hosts):
         raise ValueError("configured multi-node run has repeated hostnames; use distinct hostnames and real separate nodes")
     return dict(status="GLOBAL_PASS", mode=mode, world=world, observed_hosts=len(node_hosts),
-                session=session, run_id=group_id, expected_global=runner.counts(world, mode),
+                session=session, run_id=group_id, layout=manifests[0].get("layout", "rank-private"),
+                model=manifests[0].get("model"),
+                expected_global=runner.counts(world, mode, manifests[0].get("layout", "rank-private"), len(node_hosts)),
                 note="Explicit completion and byte checks passed; no cache coherence/atomics claim")
 
 

@@ -82,28 +82,62 @@ def validate(config):
     return ranks
 
 
-def counts(world, mode):
+def shared_model(config):
+    ranks = validate(config)
+    if len(ranks) > 16:
+        raise ValueError("node-shared 2 MiB slot layout supports at most 16 NPU ranks")
+    owners, windows = [], []
+    for node in config["nodes"]:
+        members = [rank["rank"] for rank in ranks if rank["node"] == node["name"]]
+        owner = members[0]
+        owners.append(owner)
+        windows.append(dict(owner=owner, kind="DRAM"))
+        windows.extend(dict(owner=rank, kind="HBM") for rank in members)
+    return dict(cpu_owners=owners, npu_actors=list(range(len(ranks))), windows=windows)
+
+
+def counts(world, mode, layout="rank-private", nodes=None):
+    if layout == "node-shared":
+        if nodes is None or not 1 <= nodes <= world:
+            raise ValueError("node-shared counts require a valid node count")
+        windows = world + nodes
+        kernel = mode in ("kernel", "combined")
+        return dict(hixl_cases=8 * nodes * windows if mode in ("hixl", "combined") else 0,
+                    kernel_cases=4 * world * windows if kernel else 0,
+                    handoff_cases=(2 * nodes * world * (world - 1) if kernel else 0) +
+                                  (4 * nodes * world if mode == "combined" else 0),
+                    shared_cases=4 * nodes if kernel else 0)
+
     return dict(hixl_cases=32 * world * (world - 1) if mode in ("hixl", "combined") else 0,
                 kernel_cases=2 * world * (2 * world) * (2 * world - 1) if mode in ("kernel", "combined") else 0,
                 handoff_cases=4 * world * (world - 1) if mode == "combined" else 0)
 
 
-def digest(config, mode, allocator):
-    text = json.dumps(dict(config=config, mode=mode, allocator=allocator), sort_keys=True, separators=(",", ":"))
+def digest(config, mode, allocator, layout="rank-private"):
+    value = dict(config=config, mode=mode, allocator=allocator)
+    if layout != "rank-private":
+        value["layout"] = layout
+    text = json.dumps(value, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode()).hexdigest()
 
 
 def command(rank, config, world, args):
+    extra = []
+    if args.layout == "node-shared":
+        owner = next(item["rank"] for item in validate(config) if item["node"] == rank["node"])
+        extra = ["--layout", args.layout, "--node-owner", str(owner)]
     return [str(ROOT / "build/matrix"), "--rank", str(rank["rank"]), "--world", str(world),
             "--device", str(rank["device"]), "--numa", str(rank["numa"]),
             "--engine", rank["engine"], "--coordinator", config["coordinator"],
             "--mode", args.mode, "--allocator", args.allocator,
-            "--session", digest(config, args.mode, args.allocator),
+            "--session", digest(config, args.mode, args.allocator, args.layout),
             "--kernel-library", str(ROOT / "build/libfabric_copy.so"),
-            "--control-timeout", str(args.control_timeout)]
+            "--control-timeout", str(args.control_timeout)] + extra
 
 
-def check_log(text, rank, world, mode):
+def check_log(text, rank, world, mode, layout="rank-private", config=None):
+    if layout == "node-shared":
+        return check_shared_log(text, rank, world, mode, config)
     run_id(text)
     expected = counts(world, mode)
     line = (f"RANK_PASS rank={rank} hixl_cases={expected['hixl_cases']} "
@@ -120,6 +154,38 @@ def check_log(text, rank, world, mode):
     for label, number in own.items():
         if len(re.findall(rf"^{label} ", text, re.M)) != number:
             raise ValueError(f"rank {rank}: {label} count mismatch")
+
+
+def check_shared_log(text, rank, world, mode, config):
+    run_id(text)
+    model = shared_model(config)
+    nodes = len(model["cpu_owners"])
+    windows = len(model["windows"])
+    expected = counts(world, mode, "node-shared", nodes)
+    line = (f"RANK_PASS rank={rank} hixl_cases={expected['hixl_cases']} "
+            f"kernel_cases={expected['kernel_cases']} handoff_cases={expected['handoff_cases']} "
+            f"shared_cases={expected['shared_cases']} layout=node-shared cleanup=PASS")
+    model_line = (f"SHARED_MODEL cpu_actors={nodes} npu_actors={world} windows={windows} "
+                  f"dram_allocations={nodes} hbm_allocations={world}")
+    if text.splitlines().count(line) != 1 or text.splitlines().count(model_line) != 1 or "_FAIL" in text:
+        raise ValueError(f"rank {rank}: shared model/success record missing or failure in log")
+    owns_dram = rank in model["cpu_owners"]
+    checks = dict(BASELINE_PASS=2,
+                  HOST_CASE_PASS=8 * windows if owns_dram and expected["hixl_cases"] else 0,
+                  NODE_KERNEL_CASE_PASS=4 * windows if expected["kernel_cases"] else 0,
+                  NODE_HANDOFF_PASS=expected["handoff_cases"] if rank == 0 else 0,
+                  SHARED_GROUP_PASS=expected["shared_cases"] if rank == 0 else 0,
+                  SHARED_DRAM_VIEW=nodes if expected["kernel_cases"] else 0)
+    for kind, number in (("DRAM", int(owns_dram)), ("HBM", 1)):
+        allocated = re.findall(rf"^ALLOC_OK rank={rank} kind={kind} ", text, re.M)
+        if len(allocated) != number:
+            raise ValueError(f"rank {rank}: expected {number} owned {kind} allocations")
+    if mode == "combined":
+        owned = 2 if owns_dram else 1
+        checks.update(LIFECYCLE_ACQUIRE_PASS=owned, LIFECYCLE_BUSY_PASS=1, LIFECYCLE_RELEASE_PASS=owned)
+    for label, number in checks.items():
+        if len(re.findall(rf"^{label} ", text, re.M)) != number:
+            raise ValueError(f"rank {rank}: shared {label} count mismatch")
 
 
 def run_id(text):
@@ -151,6 +217,11 @@ def stop(children):
 
 def launch(config, ranks, args):
     world = len(validate(config))
+    if args.layout == "node-shared":
+        shared_model(config)
+        if args.allocator != "vmm":
+            raise ValueError("node-shared requires the vmm allocator")
+    expected = counts(world, args.mode, args.layout, len(config["nodes"]))
     if args.mode != "baseline" and world < 2:
         raise ValueError("hixl/kernel/combined require at least two ranks")
     if not ranks:
@@ -158,7 +229,8 @@ def launch(config, ranks, args):
     if args.dry_run:
         for rank in ranks:
             print(json.dumps(dict(rank=rank, argv=command(rank, config, world, args)), ensure_ascii=False))
-        print(json.dumps(dict(expected=counts(world, args.mode), world=world)))
+        print(json.dumps(dict(expected=expected, world=world, layout=args.layout,
+                              model=shared_model(config) if args.layout == "node-shared" else None)))
         return 0
     binary = ROOT / "build/matrix"
     if not binary.is_file():
@@ -171,12 +243,12 @@ def launch(config, ranks, args):
         raise ValueError("unresolved shared library:\n" + linked)
     output = Path(args.output or ROOT / "results" / (time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"))
     output.mkdir(parents=True, exist_ok=False)
-    expected = counts(world, args.mode)
     manifest = dict(status="RUNNING", mode=args.mode, allocator=args.allocator, world=world,
+                    layout=args.layout, model=shared_model(config) if args.layout == "node-shared" else None,
                     config=config, ranks=ranks, expected_global=expected,
                     binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                     build_info=json.loads((ROOT / "build/build-info.json").read_text()),
-                    selected_libraries=linked, session=digest(config, args.mode, args.allocator),
+                    selected_libraries=linked, session=digest(config, args.mode, args.allocator, args.layout),
                     hostname=socket.gethostname(), result_scope="local ranks only; collect every node's result")
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
     print(f"RESULT_DIR={output}", flush=True)
@@ -202,7 +274,7 @@ def launch(config, ranks, args):
         group_id = None
         for rank in ranks:
             text = (output / f"rank-{rank['rank']}.log").read_text()
-            check_log(text, rank["rank"], world, args.mode)
+            check_log(text, rank["rank"], world, args.mode, args.layout, config)
             if group_id is None:
                 group_id = run_id(text)
             if group_id != run_id(text):
@@ -243,6 +315,8 @@ def main(argv=None):
             if name == "node":
                 item.add_argument("--node", required=True)
         item.add_argument("--mode", choices=MODES, default="hixl")
+        item.add_argument("--layout", choices=("rank-private", "node-shared"), default="rank-private",
+                          help="每 rank 独立 DRAM，或每节点只有一块 DRAM 供所有 NPU 共同访问")
         item.add_argument("--allocator", choices=("vmm", "adxl"), default="vmm")
         item.add_argument("--control-timeout", type=int, default=60)
         item.add_argument("--timeout", type=int, default=1800, help="本机子进程的总时限，秒")

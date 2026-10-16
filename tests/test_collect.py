@@ -71,3 +71,29 @@ class CollectTests(unittest.TestCase):
         self.change(self.directories[1], status="FAIL")
         with self.assertRaises(ValueError):
             collector.collect(self.directories)
+
+    def enable_shared(self):
+        model = collector.runner.shared_model(self.config)
+        session = collector.runner.digest(self.config, "baseline", "vmm", "node-shared")
+        for rank, directory in enumerate(self.directories):
+            self.change(directory, layout="node-shared", model=model, session=session)
+            (directory / f"rank-{rank}.log").write_text(
+                "RUN_ID=" + "a" * 32 + "\n" +
+                "SHARED_MODEL cpu_actors=2 npu_actors=2 windows=4 dram_allocations=2 hbm_allocations=2\n" +
+                f"ALLOC_OK rank={rank} kind=DRAM address=example\n" +
+                f"ALLOC_OK rank={rank} kind=HBM address=example\n" +
+                "BASELINE_PASS \nBASELINE_PASS \n" +
+                f"RANK_PASS rank={rank} hixl_cases=0 kernel_cases=0 handoff_cases=0 shared_cases=0 layout=node-shared cleanup=PASS\n")
+
+    def test_shared_model_collects(self):
+        self.enable_shared()
+        result = collector.collect(self.directories)
+        self.assertEqual(result["layout"], "node-shared")
+        self.assertEqual(len(result["model"]["windows"]), 4)
+        self.assertEqual(result["expected_global"]["shared_cases"], 0)
+
+    def test_shared_manifest_must_match_real_plan(self):
+        self.enable_shared()
+        self.change(self.directories[1], model=dict(cpu_owners=[0], windows=[]))
+        with self.assertRaises(ValueError):
+            collector.collect(self.directories)

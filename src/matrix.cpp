@@ -35,6 +35,9 @@ int gWorld = 1;
 int gNuma = -1;
 bool gRawVmm = true;
 bool gDomainHandles = false;
+bool gNodeShared = false;
+int gNodeOwner = -1;
+std::vector<int> gNodeOwners;
 std::string gEngine;
 std::string gKernelLibrary;
 control::Group *gGroup = nullptr;
@@ -56,6 +59,16 @@ struct Peer {
   char hostname[256]{};
 };
 
+struct Write {
+  int target_rank;
+  int target_kind;
+  size_t target_offset;
+  int source_rank;
+  int source_kind;
+  size_t source_offset;
+  size_t bytes;
+};
+
 class Endpoint {
  public:
   explicit Endpoint(int rank) : rank_(rank) {
@@ -74,6 +87,7 @@ class Endpoint {
 
   void Allocate() {
     for (int kind = 0; kind < 2; ++kind) {
+      if (gNodeShared && kind == 0 && rank_ != gNodeOwner) continue;
       auto type = kind == 0 ? adxl::MEM_HOST : adxl::MEM_DEVICE;
       std::printf("ALLOC_BEGIN rank=%d kind=%s bytes=%zu\n", rank_, Name(kind), kBytes);
       // ADXL's legacy allocator supports Host memory only; HBM always uses ACL VMM.
@@ -125,6 +139,7 @@ class Endpoint {
     Check(engine_.Initialize(peer_.engine, options), "Hixl::Initialize");
     engine_ready_ = true;
     for (int kind = 0; kind < 2; ++kind) {
+      if (!buffers_[kind]) continue;
       hixl::MemDesc desc{};
       desc.addr = peer_.address[kind];
       desc.len = kBytes;
@@ -137,6 +152,7 @@ class Endpoint {
   void Fill(int test) {
     std::vector<uint8_t> data(kBytes);
     for (int kind = 0; kind < 2; ++kind) {
+      if (!buffers_[kind]) continue;
       for (size_t i = 0; i < kBytes; ++i) data[i] = Pattern(test, rank_, kind, i);
       if (kind == 0) {
         // A real CPU store into the Fabric DRAM allocation, not an ACL staging copy.
@@ -151,6 +167,7 @@ class Endpoint {
               int source_kind, size_t length) {
     std::vector<uint8_t> staging(kBytes);
     for (int kind = 0; kind < 2; ++kind) {
+      if (!buffers_[kind]) continue;
       const uint8_t *data = static_cast<uint8_t *>(buffers_[kind]);
       if (kind == 1) {
         Check(aclrtMemcpy(staging.data(), kBytes, buffers_[kind], kBytes, ACL_MEMCPY_DEVICE_TO_HOST), "verify HBM");
@@ -167,6 +184,32 @@ class Endpoint {
                                    std::to_string(rank_) + " kind=" + Name(kind) + " offset=" +
                                    std::to_string(i) + " expected=" + std::to_string(expected) +
                                    " actual=" + std::to_string(data[i]));
+        }
+      }
+    }
+  }
+
+  void VerifyWrites(int test, const std::vector<Write> &writes) {
+    std::vector<uint8_t> staging(kBytes);
+    for (int kind = 0; kind < 2; ++kind) {
+      if (!buffers_[kind]) continue;
+      const uint8_t *data = static_cast<const uint8_t *>(buffers_[kind]);
+      if (kind == 1) {
+        Check(aclrtMemcpy(staging.data(), kBytes, buffers_[kind], kBytes, ACL_MEMCPY_DEVICE_TO_HOST), "shared verify HBM");
+        data = staging.data();
+      }
+      for (size_t offset = 0; offset < kBytes; ++offset) {
+        uint8_t expected = Pattern(test, rank_, kind, offset);
+        for (const auto &write : writes) {
+          if (write.target_rank == rank_ && write.target_kind == kind && offset >= write.target_offset &&
+              offset - write.target_offset < write.bytes) {
+            expected = Pattern(test, write.source_rank, write.source_kind,
+                               write.source_offset + offset - write.target_offset);
+          }
+        }
+        if (data[offset] != expected) {
+          throw std::runtime_error("shared data/guard mismatch test=" + std::to_string(test) +
+              " owner=" + std::to_string(rank_) + " kind=" + Name(kind) + " offset=" + std::to_string(offset));
         }
       }
     }
@@ -244,6 +287,7 @@ class Endpoint {
 
 struct FabricDescriptors {
   aclrtMemFabricHandle handles[2]{};
+  uint32_t valid[2]{};
 };
 
 class KernelViews {
@@ -262,6 +306,8 @@ class KernelViews {
     }
     FabricDescriptors local{};
     for (int kind = 0; kind < 2; ++kind) {
+      if (!ep.buffers_[kind]) continue;
+      local.valid[kind] = 1;
       addresses_[rank * 2 + kind] = ep.buffers_[kind];
       if (gDomainHandles) {
         Check(acquire_(ep.buffers_[kind], kBytes, &local.handles[kind]), "domain window acquire");
@@ -283,6 +329,7 @@ class KernelViews {
     for (int peer = 0; peer < gWorld; ++peer) {
       if (peer == rank) continue;
       for (int kind = 0; kind < 2; ++kind) {
+        if (!descriptors[peer].valid[kind]) continue;
         const int index = peer * 2 + kind;
         Check(aclrtMemImportFromShareableHandleV2(&descriptors[peer].handles[kind],
                 ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, 0, &imported_[index]), "import kernel Fabric handle");
@@ -297,7 +344,16 @@ class KernelViews {
     launch_ = reinterpret_cast<Launch>(dlsym(library_, "launch_fabric_copy"));
     if (!launch_) throw std::runtime_error("kernel entry missing");
     Check(aclrtCreateStream(&stream_), "kernel create stream");
-    std::printf("KERNEL_MAPS_READY rank=%d windows=%d auxiliary_acl_mapping=true\n", rank, gWorld * 2);
+    size_t live_windows = std::count_if(addresses_.begin(), addresses_.end(), [](void *address) { return address != nullptr; });
+    std::printf("KERNEL_MAPS_READY rank=%d windows=%zu auxiliary_acl_mapping=true\n", rank, live_windows);
+    if (gNodeShared) {
+      for (int peer = 0; peer < gWorld; ++peer) {
+        if (gNodeOwners[peer] == peer) {
+          std::printf("SHARED_DRAM_VIEW rank=%d owner=%d address=%p source=%s\n",
+                      rank, peer, addresses_[peer * 2], peer == rank ? "OWNER" : "IMPORTED");
+        }
+      }
+    }
   }
 
   void Copy(int source, int destination, size_t bytes, size_t source_offset = kSourceOffset,
@@ -311,6 +367,7 @@ class KernelViews {
   void CheckRegisteredReleaseGuard() {
     if (!gDomainHandles) return;
     for (void *address : acquired_) {
+      if (!address) continue;
       if (release_(address) != hixl::RESOURCE_EXHAUSTED) {
         throw std::runtime_error("window release was not rejected while HIXL registered it");
       }
@@ -368,7 +425,7 @@ class KernelViews {
   void *acquired_[2]{};
 };
 
-struct Counts { int hixl = 0; int kernel = 0; int handoff = 0; };
+struct Counts { int hixl = 0; int kernel = 0; int handoff = 0; int shared = 0; };
 
 void Baseline(Endpoint &ep, int rank) {
   for (bool to_hbm : {true, false}) {
@@ -479,14 +536,18 @@ void RunHandoffs(Endpoint &ep, KernelViews &views, const std::vector<Peer> &peer
   }
 }
 
+#include "node_shared.h"
+
 void Run(int rank, const std::string &mode) {
   // Failure is fail-stop: main exits without unsafe distributed cleanup. Normal cleanup is explicit.
   auto *owner = new Endpoint(rank);
   auto *views_owner = new KernelViews;
   Endpoint &ep = *owner;
   KernelViews &views = *views_owner;
+  if (gNodeShared) PrepareSharedModel(ep, rank);
   ep.Allocate();
-  Baseline(ep, rank);
+  if (gNodeShared) SharedBaseline(ep, rank);
+  else Baseline(ep, rank);
   bool hixl = mode == "hixl" || mode == "combined";
   bool kernel = mode == "kernel" || mode == "combined";
   auto identities = gGroup->AllGather(ep.peer_);
@@ -510,9 +571,13 @@ void Run(int rank, const std::string &mode) {
   }
   Barrier(0);
   Counts counts;
-  if (hixl) RunHixl(ep, peers, rank, counts);
-  if (kernel) RunKernel(ep, views, rank, counts);
-  if (mode == "combined") RunHandoffs(ep, views, peers, rank, counts);
+  if (gNodeShared) {
+    RunShared(ep, views, peers, rank, mode, counts);
+  } else {
+    if (hixl) RunHixl(ep, peers, rank, counts);
+    if (kernel) RunKernel(ep, views, rank, counts);
+    if (mode == "combined") RunHandoffs(ep, views, peers, rank, counts);
+  }
   Barrier(-1);  // Every NPU stream and every HIXL operation has completed.
   ep.CloseEngine();
   Barrier(-2);  // No HIXL peer retains imported mappings after this point.
@@ -523,8 +588,13 @@ void Run(int rank, const std::string &mode) {
   Barrier(-4);  // Report success only after all owners have cleaned up.
   delete views_owner;
   delete owner;
-  std::printf("RANK_PASS rank=%d hixl_cases=%d kernel_cases=%d handoff_cases=%d cleanup=PASS\n",
-              rank, counts.hixl, counts.kernel, counts.handoff);
+  if (gNodeShared) {
+    std::printf("RANK_PASS rank=%d hixl_cases=%d kernel_cases=%d handoff_cases=%d shared_cases=%d layout=node-shared cleanup=PASS\n",
+                rank, counts.hixl, counts.kernel, counts.handoff, counts.shared);
+  } else {
+    std::printf("RANK_PASS rank=%d hixl_cases=%d kernel_cases=%d handoff_cases=%d cleanup=PASS\n",
+                rank, counts.hixl, counts.kernel, counts.handoff);
+  }
 }
 }  // namespace
 
@@ -552,6 +622,11 @@ int main(int argc, char **argv) {
       else if (option == "--coordinator") coordinator = value;
       else if (option == "--engine") gEngine = value;
       else if (option == "--mode") mode = value;
+      else if (option == "--node-owner") gNodeOwner = number();
+      else if (option == "--layout") {
+        if (value != "rank-private" && value != "node-shared") throw std::runtime_error("invalid layout");
+        gNodeShared = value == "node-shared";
+      }
       else if (option == "--session") session = value;
       else if (option == "--kernel-library") gKernelLibrary = value;
       else if (option == "--control-timeout") timeout = number();
@@ -566,6 +641,9 @@ int main(int argc, char **argv) {
         (mode != "baseline" && gWorld < 2) ||
         ((mode == "kernel" || mode == "combined") && gKernelLibrary.empty())) {
       throw std::runtime_error("invalid/missing options; use scripts/run.py");
+    }
+    if (gNodeShared && (gNodeOwner < 0 || gNodeOwner > rank || !gRawVmm)) {
+      throw std::runtime_error("node-shared requires a valid node owner and the vmm allocator");
     }
     gDomainHandles = mode == "combined";
     struct Settings { char session[65]{}; char mode[16]{}; uint32_t handle_size; uint32_t pointer_size; uint32_t endian; };
