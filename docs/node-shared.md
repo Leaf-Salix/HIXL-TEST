@@ -77,20 +77,265 @@ bash scripts/rank.sh single --devices 0,1 --layout node-shared --mode combined
 共享机器须在预约任务中执行。README 的 task-submit 示例添加 `--layout node-shared` 即可。
 `--scheduled-devices`、NUMA、可见设备编号规则不变。
 
-## 双机六参与者／六窗口
+## 双机六参与者／六窗口：A、B 完整操作步骤
 
-继续用相同的 `configs/site.json`，每节点 devices 配两张已预约 NPU。
-每台编译相同新版代码，两个节点均加 `--layout node-shared`；模式和配置必须一致。
+下面使用每台两张 NPU、两台真实机器的模型；不需要公网，也不要求安装 MPI。
+前提是两机已经处于**同一 A3 HCCS/Fabric 超节点**，具有 Host DRAM 的 Fabric 访问权限。
+普通以太网/RoCE 连通不能代替这个前提。
+
+所有硬件命令都在现场调度器已预约两卡的环境中执行；脚本不会替两台机器预约或 SSH 拉起进程。
+配置中的设备号是该预约环境内的 **ACL 逻辑 ID**，不是直接照抄物理卡号。
+例如预约掩码把两卡重新编号为 `0,1`，就填 `0,1`；检查日志 `DEVICE` 的物理映射。
+`node` 子命令不接受 `--scheduled-devices`，也不会替配置做设备重编号。
+
+### 1. 两台机器准备同一版本并编译
+
+把同一个新版源码包离线解包到两机，或使用已经更新到相同提交的 checkout。
+必须包含 `src/node_shared.h`；不能沿用旧版 `build/matrix`。
+下面的 `/path/to/...` 都换成现场路径；两机 SDK/适配库版本应一致，安装路径可不同。
+若上次四模式全通过时已有适配库，可以复用；不要把系统 HIXL 覆盖掉。
+
+**机器 A：**
 
 ```bash
-# A 机器预约环境：
-bash scripts/rank.sh node --config configs/site.json --node node-a --layout node-shared --mode combined
-# B 机器预约环境：
-bash scripts/rank.sh node --config configs/site.json --node node-b --layout node-shared --mode combined
+export TEST_ROOT=/path/to/HIXL-TEST
+export CANN_ENV=/path/to/cann/set_env.sh
+# 指向原版库，或上次 hixl 模式已通过的隔离兼容库；不是 combined 实验桥。
+export HIXL_INCLUDE_DIR=/path/to/hixl/include
+export HIXL_LIB_DIR=/path/to/hixl/lib64
+# 上次 combined 已通过的实验桥目录；默认构建产物是下面这个路径。
+export DOMAIN_LIB_DIR="$TEST_ROOT/build/domain/lib"
+export PYTHONNOUSERSITE=1
+cd "$TEST_ROOT"
+source "$CANN_ENV"
+test -f src/node_shared.h
+bash scripts/build.sh
+mkdir -p results
+# 本次四轮使用一个新的本地父目录；不要重复使用旧结果目录。
+export RUN_A=$(mktemp -d "$TEST_ROOT/results/node-shared-A-XXXXXXXX")
+printf 'RUN_A=%s\n' "$RUN_A"
 ```
 
-也分别运行 baseline、hixl、kernel。仅 combined 使用实验桥；不同模式要分别保留结果目录。
-MPI 入口同样支持该选项；hostfile、rank 顺序和现场环境规则见 [多机说明](multinode.md)。
+**机器 B：**
+
+```bash
+export TEST_ROOT=/path/to/HIXL-TEST
+export CANN_ENV=/path/to/cann/set_env.sh
+export HIXL_INCLUDE_DIR=/path/to/hixl/include
+export HIXL_LIB_DIR=/path/to/hixl/lib64
+export DOMAIN_LIB_DIR="$TEST_ROOT/build/domain/lib"
+export PYTHONNOUSERSITE=1
+cd "$TEST_ROOT"
+source "$CANN_ENV"
+test -f src/node_shared.h
+bash scripts/build.sh
+mkdir -p results
+export RUN_B=$(mktemp -d "$TEST_ROOT/results/node-shared-B-XXXXXXXX")
+printf 'RUN_B=%s\n' "$RUN_B"
+```
+
+`build.sh` 默认同时编译 Host 程序和 AIV kernel，不能加 `--host-only`。
+若 HIXL 随 CANN 安装，include/lib 路径通常分别为 `$ASCEND_HOME_PATH/include` 和 `$ASCEND_HOME_PATH/lib64`。
+这些变量及 `RUN_A/RUN_B` 在后面继续使用，请保留各自终端；重新进入预约环境时重新设置。
+
+**只有没有准备好实验桥时，才在 A、B 各执行下面这段准备 combined。**
+需要离线带入指定 beta2 的全新独立源码和已展开依赖，版本与依赖清单见 [实验桥说明](experimental.md)。
+已有适配库直接跳过本段，把上面的 `DOMAIN_LIB_DIR` 指向实际目录；不要对已打补丁的源码重复应用补丁。
+
+```bash
+cd "$TEST_ROOT"
+export HIXL_SRC=/path/to/isolated/pristine-hixl-v9.1.0-beta.2
+export CANN_3RD_LIB_PATH=/path/to/expanded-hixl-third-party
+python3 scripts/apply_domain_patch.py "$HIXL_SRC" --check
+python3 scripts/apply_domain_patch.py "$HIXL_SRC"
+bash scripts/build_domain.sh "$HIXL_SRC"
+export DOMAIN_LIB_DIR="$TEST_ROOT/build/domain/lib"
+```
+
+### 2. A 生成配置，B 使用完全相同的配置
+
+优先复用上次双机四模式通过的 `configs/site.json`，确认每台两卡、逻辑设备号及 NUMA 与本次预约一致。
+在 A 执行：
+
+```bash
+cd "$TEST_ROOT"
+cp configs/site.json configs/site-node-shared.json
+```
+
+如果没有旧配置，才改用下面这段在 A 新建。示例地址是文档保留地址，**必须把两个 IP、两组设备号和 NUMA 改为现场值**。
+每台 `numa_ids` 第一项决定该机唯一 DRAM 的 NUMA；第二项保持与设备列表对应。
+控制端口 `39000`、两机各自的 HIXL 端口 `39100/39101` 必须空闲且按现场要求放通。
+
+```bash
+cd "$TEST_ROOT"
+cat > configs/site-node-shared.json <<'JSON'
+{
+  "coordinator": "198.51.100.10:39000",
+  "nodes": [
+    {"name": "node-a", "ip": "198.51.100.10", "devices": [0, 1], "numa_ids": [0, 2], "engine_port_base": 39100},
+    {"name": "node-b", "ip": "198.51.100.11", "devices": [0, 1], "numa_ids": [0, 2], "engine_port_base": 39100}
+  ]
+}
+JSON
+# 运行前编辑为真实配置；不要直接测试保留地址。
+"${EDITOR:-vi}" configs/site-node-shared.json
+```
+
+以下假定配置节点名为 `node-a/node-b`；复用旧配置时名称不同，就同步替换后面命令中的 `--node`。
+在 A 将配置传给 B（替换 B 的 SSH 登录及仓库绝对路径）：
+
+```bash
+export B_SSH=user@node-b-hostname
+export B_TEST_ROOT=/path/to/HIXL-TEST
+rsync -av --exclude '._*' --exclude '.DS_Store' \
+  configs/site-node-shared.json "$B_SSH:$B_TEST_ROOT/configs/site-node-shared.json"
+sha256sum configs/site-node-shared.json
+```
+
+B 执行以下命令，摘要必须与 A 相同。若现场没有 SSH，用获准的离线通道复制该文件。
+
+```bash
+cd "$TEST_ROOT"
+sha256sum configs/site-node-shared.json
+```
+
+### 3. 两边先 dry-run 检查六窗口模型
+
+下面两条命令不访问 NPU，也不建立通信：
+
+**A：**
+
+```bash
+bash scripts/rank.sh node --config configs/site-node-shared.json --node node-a \
+  --layout node-shared --allocator vmm --mode combined --dry-run
+```
+
+**B：**
+
+```bash
+bash scripts/rank.sh node --config configs/site-node-shared.json --node node-b \
+  --layout node-shared --allocator vmm --mode combined --dry-run
+```
+
+两边预期均为 `world=4`、`cpu_owners=[0,2]`、`npu_actors=[0,1,2,3]`，六个窗口为：
+`DRAM(owner0), HBM(owner0), HBM(owner1), DRAM(owner2), HBM(owner2), HBM(owner3)`。
+预期 combined 计数为 `96/96/80/8`，合计 280。
+
+### 4. 按轮运行：baseline → hixl → kernel → combined
+
+**每轮先启动 A，再在 300 秒内启动 B；两边均退出且没有错误后，才执行下一轮。**
+不要把 A 的四轮一次性连续粘贴后才去启动 B。
+`--control-timeout 300` 是控制等待时限，`--timeout 3600` 是本机 launcher 总时限，调度预约也要留足时间。
+所有命令都显式指定 `node-shared/vmm`；每轮结果目录独立。
+
+**第 1 轮 baseline，A：**
+
+```bash
+bash scripts/rank.sh node --config configs/site-node-shared.json --node node-a \
+  --layout node-shared --allocator vmm --mode baseline \
+  --control-timeout 300 --timeout 3600 --output "$RUN_A/baseline"
+```
+
+**第 1 轮 baseline，B：**
+
+```bash
+bash scripts/rank.sh node --config configs/site-node-shared.json --node node-b \
+  --layout node-shared --allocator vmm --mode baseline \
+  --control-timeout 300 --timeout 3600 --output "$RUN_B/baseline"
+```
+
+**第 2 轮 hixl，A：**
+
+```bash
+bash scripts/rank.sh node --config configs/site-node-shared.json --node node-a \
+  --layout node-shared --allocator vmm --mode hixl \
+  --control-timeout 300 --timeout 3600 --output "$RUN_A/hixl"
+```
+
+**第 2 轮 hixl，B：**
+
+```bash
+bash scripts/rank.sh node --config configs/site-node-shared.json --node node-b \
+  --layout node-shared --allocator vmm --mode hixl \
+  --control-timeout 300 --timeout 3600 --output "$RUN_B/hixl"
+```
+
+**第 3 轮 kernel，A：**
+
+```bash
+bash scripts/rank.sh node --config configs/site-node-shared.json --node node-a \
+  --layout node-shared --allocator vmm --mode kernel \
+  --control-timeout 300 --timeout 3600 --output "$RUN_A/kernel"
+```
+
+**第 3 轮 kernel，B：**
+
+```bash
+bash scripts/rank.sh node --config configs/site-node-shared.json --node node-b \
+  --layout node-shared --allocator vmm --mode kernel \
+  --control-timeout 300 --timeout 3600 --output "$RUN_B/kernel"
+```
+
+**第 4 轮 combined，A：**
+
+```bash
+# 先确认实验库提供两个非官方接口；只有该轮切换库，不改变后续终端的原版库变量。
+nm -D "$DOMAIN_LIB_DIR/libcann_hixl.so" | grep -E ' HixlDomainWindow(Acquire|Release)$'
+HIXL_LIB_DIR="$DOMAIN_LIB_DIR" bash scripts/rank.sh node \
+  --config configs/site-node-shared.json --node node-a \
+  --layout node-shared --allocator vmm --mode combined \
+  --control-timeout 300 --timeout 3600 --output "$RUN_A/combined"
+```
+
+**第 4 轮 combined，B：**
+
+```bash
+nm -D "$DOMAIN_LIB_DIR/libcann_hixl.so" | grep -E ' HixlDomainWindow(Acquire|Release)$'
+HIXL_LIB_DIR="$DOMAIN_LIB_DIR" bash scripts/rank.sh node \
+  --config configs/site-node-shared.json --node node-b \
+  --layout node-shared --allocator vmm --mode combined \
+  --control-timeout 300 --timeout 3600 --output "$RUN_B/combined"
+```
+
+`nm` 应列出 Acquire、Release 两个符号；缺失时先纠正实验库路径，不要把原版库当成 combined 适配库。
+检查 combined 的 manifest 中 `selected_libraries`：`libcann_hixl.so` 和 `libllm_datadist.so` 应来自实验目录。
+任一轮失败，保留两边目录并停止后续轮次；重试时在两边使用新的输出目录，不覆盖旧证据。
+
+### 5. B 打包结果，A 收齐四轮再汇总
+
+两机四轮都结束后，在 **B** 执行：
+
+```bash
+export B_RESULT_ARCHIVE="$RUN_B.tar.gz"
+tar -C "$(dirname "$RUN_B")" -czf "$B_RESULT_ARCHIVE" "$(basename "$RUN_B")"
+printf 'B_RESULT_ARCHIVE=%s\n' "$B_RESULT_ARCHIVE"
+```
+
+在 **A** 执行；将 `B_RESULT_ARCHIVE` 改成上一步 B 打印的绝对路径，`B_SSH` 沿用配置同步时的登录：
+
+```bash
+export B_RESULT_ARCHIVE=/path/from/B/node-shared-B-XXXXXXXX.tar.gz
+export COLLECT_ROOT=$(mktemp -d "$TEST_ROOT/results/node-shared-collect-XXXXXXXX")
+rsync -avP --exclude '._*' --exclude '.DS_Store' \
+  "$B_SSH:$B_RESULT_ARCHIVE" "$COLLECT_ROOT/"
+tar -xzf "$COLLECT_ROOT/$(basename "$B_RESULT_ARCHIVE")" -C "$COLLECT_ROOT"
+export B_RESULTS="$COLLECT_ROOT/$(basename "$B_RESULT_ARCHIVE" .tar.gz)"
+(
+  set -euo pipefail
+  for mode in baseline hixl kernel combined; do
+    python3 scripts/collect.py "$RUN_A/$mode" "$B_RESULTS/$mode" \
+      | tee "$COLLECT_ROOT/global-$mode.json"
+  done
+)
+```
+
+四轮都应出现 `GLOBAL_PASS`，且 `layout=node-shared`、`world=4`、`observed_hosts=2`。
+combined 应包含六窗口模型与 `hixl_cases=96, kernel_cases=96, handoff_cases=80, shared_cases=8`。
+`LOCAL_RANKS_PASS` 只代表本地两 rank；必须收齐同一次运行的 A/B 结果，不能代替全局通过。
+原始结果含现场路径、主机名、地址和运行时句柄，只在现场允许的通道保存/传输，不提交到公开仓库。
+
+MPI 入口也支持 `--layout node-shared`，仍是 **4 ranks**；hostfile 和环境传递规则见 [多机说明](multinode.md)。
+本节的两终端启动与 MPI 启动是两种选择，不要同时使用。
 
 ### 预期全局计数
 
