@@ -2,6 +2,17 @@
 
 日期：2026-10-16（Asia/Shanghai）。
 
+## CPU 原生 DRAM 能力探针：同机对照失败
+
+2026-10-16，经 task-submit 预约单卡，运行两个同机进程的 [CPU 原生访问能力探针](cpu-direct.md#同机双进程硬件对照fail)。
+两个进程的 Host SetAccess/GetAccess 均返回 0，查询权限为 READWRITE（flags=3），并进入 CPU 数据阶段。
+首组 CPU_A READ 对端 DRAM 时，rank0 在目标区首字节（偏移 1048576）校验不一致，
+随后 rank1 因控制连接 Broken pipe 退出。两 rank 均退出 1，零组 `CPU_CASE_PASS`，没有成功清理标记或成功 summary。
+原始产物的 source/session/build 摘要一致，并与 `f12209a` 的探针源码匹配。
+
+该结果记为 **FAIL，不是 UNSUPPORTED 或 CPU 直接访问通过**；根因尚未确定，双机 CPU 原生访问仍未实测。
+它不改变下文已经通过的 NPU SDMA、AIV 或 HIXL 测试结果，也不能证明硬件没有 CPU-HCCS 连接。
+
 ## 独立 DRAM 路径探针
 
 新增 [DRAM_A→DRAM_B 路径验证](dram-route.md)，记录实际拷贝 VA 的驱动查询，

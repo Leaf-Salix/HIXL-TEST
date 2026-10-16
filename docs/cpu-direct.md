@@ -208,5 +208,28 @@ tar -czf "$TEST_ROOT/results/$RUN_ID-evidence.tar.gz" -C "$TEST_ROOT/results" \
 ## 实测边界
 
 2026-10-16 已使用系统 CANN 9.0 编译本探针，并核对 binary 未引用 memcpy、stream 创建或 kernel 启动 API。
-源码/格式检查、47 项仓库 UT 和独立实现审查通过；同机双进程硬件对照已提交预约，记录本版文档时仍在排队，未记为通过。
+源码/格式检查、47 项仓库 UT 和独立实现审查通过。
+
+### 同机双进程硬件对照：FAIL
+
+2026-10-16，经 task-submit 预约一张 NPU，两个进程各自初始化 context 并绑定同一预约设备，
+执行同机 Fabric Host 映射与 CPU 原生读写对照。原始日志与 manifest 已复核；
+两端 source/session/build 摘要一致，并与提交 `f12209a` 的探针源码一致。
+
+| 阶段 | 实际结果 |
+| --- | --- |
+| 环境及独立 ACL/profiler 初始化基线 | 通过；这一步不是 CPU 数据搬运验证 |
+| 两端 Host 访问权限 | `set_rc=0 get_rc=0 flags=3 ready=1`；均成功设置并查询到 READWRITE |
+| CPU 数据阶段 | 两端进入 `CPU_IO_BEGIN ... fallback=NONE`；没有提交 NPU 搬运 |
+| 首组用例 | 按当前代码顺序为 CPU_A READ 对端 DRAM；rank0 在偏移 `1048576`（目标区首字节）报告 `CPU data/guard mismatch` |
+| 对端退出 | rank1 随后报告控制连接 `Broken pipe`；这是 rank0 失败退出后的次生错误，不是独立的第二个数据错误证据 |
+| 完成与汇总 | 两个 rank 均退出 1；没有任何 `CPU_CASE_PASS` 或 `cleanup=PASS`，收集器拒绝失败结果，没有生成成功 summary |
+
+**本次结论是数据校验失败，不是 `UNSUPPORTED`，也不是 `SINGLE_HOST_CPU_PASS`。**
+API 返回成功与实际 CPU 数据访问通过是两项独立条件；前者在本次满足，后者没有满足。
+全窗口校验在首个目标字节中止，未完成四组 READ/WRITE 和 guard 验收，正常清理路径也未走到完成标记。
+日志没有记录该字节的实际值，尚不能据此确定映射、缓存可见性或探针实现中的具体根因。
+
+本版本尚无通过的同机 CPU 数据访问验收结果；上面的双机命令保留为实验排障入口，不能当作已验证可用流程。
 双机 CPU 原生访问尚未实测；公开实现的拒绝分支不替代你现场安装版本的运行结果。
+本次同机失败也不能证明 CPU 没有物理接入 HCCS，或证明硬件不可能提供跨机访问能力。
