@@ -14,7 +14,7 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-MODES = ("baseline", "hixl", "kernel", "combined")
+MODES = ("baseline", "hixl", "kernel", "combined", "acl")
 
 
 def numbers(value):
@@ -101,12 +101,18 @@ def counts(world, mode, layout="rank-private", nodes=None):
         if nodes is None or not 1 <= nodes <= world:
             raise ValueError("node-shared counts require a valid node count")
         windows = world + nodes
-        kernel = mode in ("kernel", "combined")
-        return dict(hixl_cases=8 * nodes * windows if mode in ("hixl", "combined") else 0,
-                    kernel_cases=4 * world * windows if kernel else 0,
-                    handoff_cases=(2 * nodes * world * (world - 1) if kernel else 0) +
-                                  (4 * nodes * world if mode == "combined" else 0),
-                    shared_cases=4 * nodes if kernel else 0)
+        kernel = mode in ("kernel", "combined", "acl")
+        result = dict(hixl_cases=8 * nodes * windows if mode in ("hixl", "combined") else 0,
+                      kernel_cases=4 * world * windows if kernel else 0,
+                      handoff_cases=(2 * nodes * world * (world - 1) if kernel else 0) +
+                                    (4 * nodes * world if mode in ("combined", "acl") else 0),
+                      shared_cases=4 * nodes if kernel else 0)
+        if mode == "acl":
+            result["acl_cases"] = 8 * nodes * windows
+        return result
+
+    if mode == "acl":
+        raise ValueError("acl mode requires --layout node-shared")
 
     return dict(hixl_cases=32 * world * (world - 1) if mode in ("hixl", "combined") else 0,
                 kernel_cases=2 * world * (2 * world) * (2 * world - 1) if mode in ("kernel", "combined") else 0,
@@ -162,16 +168,17 @@ def check_shared_log(text, rank, world, mode, config):
     nodes = len(model["cpu_owners"])
     windows = len(model["windows"])
     expected = counts(world, mode, "node-shared", nodes)
+    acl_summary = f" acl_cases={expected['acl_cases']}" if mode == "acl" else ""
     line = (f"RANK_PASS rank={rank} hixl_cases={expected['hixl_cases']} "
             f"kernel_cases={expected['kernel_cases']} handoff_cases={expected['handoff_cases']} "
-            f"shared_cases={expected['shared_cases']} layout=node-shared cleanup=PASS")
+            f"shared_cases={expected['shared_cases']}{acl_summary} layout=node-shared cleanup=PASS")
     model_line = (f"SHARED_MODEL cpu_actors={nodes} npu_actors={world} windows={windows} "
                   f"dram_allocations={nodes} hbm_allocations={world}")
     if text.splitlines().count(line) != 1 or text.splitlines().count(model_line) != 1 or "_FAIL" in text:
         raise ValueError(f"rank {rank}: shared model/success record missing or failure in log")
     owns_dram = rank in model["cpu_owners"]
     checks = dict(BASELINE_PASS=2,
-                  HOST_CASE_PASS=8 * windows if owns_dram and expected["hixl_cases"] else 0,
+                  HOST_CASE_PASS=8 * windows if owns_dram and (expected["hixl_cases"] or mode == "acl") else 0,
                   NODE_KERNEL_CASE_PASS=4 * windows if expected["kernel_cases"] else 0,
                   NODE_HANDOFF_PASS=expected["handoff_cases"] if rank == 0 else 0,
                   SHARED_GROUP_PASS=expected["shared_cases"] if rank == 0 else 0,
@@ -183,6 +190,16 @@ def check_shared_log(text, rank, world, mode, config):
     if mode == "combined":
         owned = 2 if owns_dram else 1
         checks.update(LIFECYCLE_ACQUIRE_PASS=owned, LIFECYCLE_BUSY_PASS=1, LIFECYCLE_RELEASE_PASS=owned)
+    if mode == "acl":
+        checks["ACL_HOST_ALIAS"] = int(owns_dram)
+        marker = f"CANN_ACL_ONLY rank={rank} hixl_engine=DISABLED experimental_bridge=DISABLED"
+        if text.splitlines().count(marker) != 1 or re.search(r"^(ENGINE_|CONNECT_BEGIN|LIFECYCLE_)", text, re.M):
+            raise ValueError(f"rank {rank}: ACL-only backend record missing or HIXL/bridge used")
+        for path, number in dict(ACL_SYNC=4 * (windows - 1) if owns_dram else 0,
+                                 ACL_ASYNC=4 * (windows - 1) if owns_dram else 0,
+                                 CPU_MEMMOVE=8 if owns_dram else 0).items():
+            if len(re.findall(rf"^HOST_CASE_PASS .* path={path} ", text, re.M)) != number:
+                raise ValueError(f"rank {rank}: {path} CPU case count mismatch")
     for label, number in checks.items():
         if len(re.findall(rf"^{label} ", text, re.M)) != number:
             raise ValueError(f"rank {rank}: shared {label} count mismatch")
@@ -235,7 +252,7 @@ def launch(config, ranks, args):
     binary = ROOT / "build/matrix"
     if not binary.is_file():
         raise ValueError("build/matrix missing; run bash scripts/build.sh first")
-    if args.mode in ("kernel", "combined") and not (ROOT / "build/libfabric_copy.so").is_file():
+    if args.mode in ("kernel", "combined", "acl") and not (ROOT / "build/libfabric_copy.so").is_file():
         raise ValueError("kernel library missing; rebuild without --host-only")
     # Capture the selected libraries and fail before touching NPU if a dependency is absent.
     linked = subprocess.run(["ldd", str(binary)], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True).stdout

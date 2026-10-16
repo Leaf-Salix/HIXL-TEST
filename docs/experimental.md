@@ -3,6 +3,10 @@
 `hixl` 和 `kernel` 模式可分别使用原版 SDK 能力，但只有 `combined` 才验证：
 **同一块物理 DRAM/HBM 同时供 HIXL 和业务 AIV kernel 使用，并正确完成交接。**
 
+如果目标是只用系统 CANN 验证 CPU/NPU 对同一组窗口的访问与交接，使用
+[`--layout node-shared --mode acl`](node-shared.md)，不需要本节补丁。
+该入口使用 ACL 拷贝＋AIV，不能用其结果替代本节的 HIXL API 联合验证。
+
 ## 为什么不是“装好 HIXL 就能跑 combined”
 
 原单机环境使用 HIXL v9.1.0-beta.2。该版本没有公开取得内部已导出 Fabric token 的接口。

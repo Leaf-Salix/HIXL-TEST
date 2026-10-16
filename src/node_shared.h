@@ -75,7 +75,13 @@ void SharedBaseline(Endpoint &ep, int rank) {
 
 const char *CpuWindowCopy(Endpoint &ep, const std::vector<Peer> &peers, int cpu,
                           SharedWindow target, bool read, bool async, size_t bytes,
-                          size_t resource_offset = kSharedSource, size_t local_offset = kSharedTarget) {
+                          size_t resource_offset = kSharedSource, size_t local_offset = kSharedTarget,
+                          KernelViews *acl_views = nullptr) {
+  if (acl_views && !(target.owner == cpu && target.kind == 0)) {
+    acl_views->HostCopy(read ? target.View() : cpu * 2, read ? cpu * 2 : target.View(), bytes,
+                        read ? resource_offset : local_offset, read ? local_offset : resource_offset, async);
+    return async ? "ACL_ASYNC" : "ACL_SYNC";
+  }
   if (target.owner == cpu) {
     void *dram = static_cast<char *>(ep.buffers_[0]) + local_offset;
     void *resource = static_cast<char *>(ep.buffers_[target.kind]) + resource_offset;
@@ -94,20 +100,21 @@ const char *CpuWindowCopy(Endpoint &ep, const std::vector<Peer> &peers, int cpu,
   return "HIXL";
 }
 
-void RunSharedHost(Endpoint &ep, const std::vector<Peer> &peers, int rank, Counts &counts) {
+void RunSharedHost(Endpoint &ep, const std::vector<Peer> &peers, int rank, Counts &counts,
+                   KernelViews *acl_views = nullptr) {
   for (size_t bytes : {4096UL, 65536UL}) {
     for (int cpu : gCpuOwners) {
       for (const auto target : gSharedWindows) {
         for (bool read : {true, false}) {
           for (bool async : {false, true}) {
-            int test = ++counts.hixl;
+            int test = acl_views ? ++counts.acl : ++counts.hixl;
             ep.Fill(test);
             Barrier(test * 4);
             const char *path = "inactive";
             if (rank == cpu) {
               path = CpuWindowCopy(ep, peers, cpu, target, read, async, bytes,
                                    read ? kSharedSource : kSharedTarget,
-                                   read ? kSharedTarget : kSharedSource);
+                                   read ? kSharedTarget : kSharedSource, acl_views);
             }
             Barrier(test * 4 + 1);
             Write write = read ? Write{cpu, 0, kSharedTarget, target.owner, target.kind, kSharedSource, bytes}
@@ -209,7 +216,7 @@ void RunSharedNpuHandoffs(Endpoint &ep, KernelViews &views, int rank, Counts &co
 }
 
 void RunSharedCpuHandoffs(Endpoint &ep, KernelViews &views, const std::vector<Peer> &peers,
-                         int rank, Counts &counts) {
+                         int rank, Counts &counts, KernelViews *acl_views = nullptr) {
   for (size_t bytes : {4096UL, 65536UL}) {
     for (int cpu : gCpuOwners) {
       for (int npu = 0; npu < gWorld; ++npu) {
@@ -219,7 +226,8 @@ void RunSharedCpuHandoffs(Endpoint &ep, KernelViews &views, const std::vector<Pe
           ep.Fill(test);
           Barrier(test * 4);
           if (host_first) {
-            if (rank == cpu) CpuWindowCopy(ep, peers, cpu, {owner, 0}, false, false, bytes, kSharedTarget, kSharedSource);
+            if (rank == cpu) CpuWindowCopy(ep, peers, cpu, {owner, 0}, false, false, bytes,
+                                           kSharedTarget, kSharedSource, acl_views);
           } else if (rank == npu) {
             views.Copy(npu * 2 + 1, owner * 2, bytes, kSharedSource, kSharedTarget);
           }
@@ -227,7 +235,7 @@ void RunSharedCpuHandoffs(Endpoint &ep, KernelViews &views, const std::vector<Pe
           if (host_first) {
             if (rank == npu) views.Copy(owner * 2, npu * 2 + 1, bytes, kSharedTarget, kSharedTarget);
           } else if (rank == cpu) {
-            CpuWindowCopy(ep, peers, cpu, {owner, 0}, true, true, bytes, kSharedTarget, kSharedReadback);
+            CpuWindowCopy(ep, peers, cpu, {owner, 0}, true, true, bytes, kSharedTarget, kSharedReadback, acl_views);
           }
           Barrier(test * 4 + 2);
           std::vector<Write> writes;
@@ -253,10 +261,12 @@ void RunSharedCpuHandoffs(Endpoint &ep, KernelViews &views, const std::vector<Pe
 void RunShared(Endpoint &ep, KernelViews &views, const std::vector<Peer> &peers,
                int rank, const std::string &mode, Counts &counts) {
   if (mode == "hixl" || mode == "combined") RunSharedHost(ep, peers, rank, counts);
-  if (mode == "kernel" || mode == "combined") {
+  if (mode == "acl") RunSharedHost(ep, peers, rank, counts, &views);
+  if (mode == "kernel" || mode == "combined" || mode == "acl") {
     RunSharedKernel(ep, views, rank, counts);
     RunSharedConcurrent(ep, views, rank, counts);
     RunSharedNpuHandoffs(ep, views, rank, counts);
   }
   if (mode == "combined") RunSharedCpuHandoffs(ep, views, peers, rank, counts);
+  if (mode == "acl") RunSharedCpuHandoffs(ep, views, peers, rank, counts, &views);
 }

@@ -43,6 +43,44 @@ class NodeSharedTests(unittest.TestCase):
         self.assertEqual(runner.counts(4, "combined", "node-shared", 2),
                          dict(hixl_cases=96, kernel_cases=96, handoff_cases=80, shared_cases=8))
 
+    def test_acl_covers_same_matrix_without_hixl(self):
+        self.assertEqual(runner.counts(4, "acl", "node-shared", 2),
+                         dict(hixl_cases=0, acl_cases=96, kernel_cases=96, handoff_cases=80, shared_cases=8))
+        self.assertEqual(runner.counts(2, "acl", "node-shared", 1),
+                         dict(hixl_cases=0, acl_cases=24, kernel_cases=24, handoff_cases=12, shared_cases=4))
+        with self.assertRaises(ValueError):
+            runner.counts(4, "acl")
+
+    def acl_log(self, rank):
+        lines = [line for line in self.shared_log(rank).splitlines()
+                 if not line.startswith(("LIFECYCLE_", "HOST_CASE_PASS"))]
+        lines = [line.replace("hixl_cases=96", "hixl_cases=0")
+                     .replace(" layout=node-shared", " acl_cases=96 layout=node-shared") for line in lines]
+        lines.append(f"CANN_ACL_ONLY rank={rank} hixl_engine=DISABLED experimental_bridge=DISABLED")
+        if rank in (0, 2):
+            lines.append(f"ACL_HOST_ALIAS rank={rank} same_allocation=true")
+            for path, number in dict(ACL_SYNC=20, ACL_ASYNC=20, CPU_MEMMOVE=8).items():
+                lines.extend([f"HOST_CASE_PASS id=example path={path} guards=PASS"] * number)
+        return "\n".join(lines)
+
+    def test_acl_requires_both_copy_completions_and_no_hixl_bridge(self):
+        for rank in range(4):
+            text = self.acl_log(rank)
+            runner.check_log(text, rank, 4, "acl", "node-shared", self.config)
+            for extra in ("ENGINE_BEGIN ", "CONNECT_BEGIN ", "LIFECYCLE_ACQUIRE_PASS "):
+                with self.assertRaises(ValueError):
+                    runner.check_log(text + "\n" + extra, rank, 4, "acl", "node-shared", self.config)
+        for missing in ("ACL_SYNC", "ACL_ASYNC", "CPU_MEMMOVE"):
+            with self.assertRaises(ValueError):
+                runner.check_log(self.acl_log(0).replace("path=" + missing, "path=HIXL", 1),
+                                 0, 4, "acl", "node-shared", self.config)
+        with self.assertRaises(ValueError):
+            runner.check_log(self.acl_log(0).replace("CANN_ACL_ONLY", "WRONG_BACKEND"),
+                             0, 4, "acl", "node-shared", self.config)
+        with self.assertRaises(ValueError):
+            runner.check_log(self.acl_log(0).replace("ACL_HOST_ALIAS", "MISSING_ALIAS"),
+                             0, 4, "acl", "node-shared", self.config)
+
     def test_siblings_receive_same_dram_owner(self):
         ranks = runner.validate(self.config)
         args = argparse.Namespace(mode="combined", allocator="vmm", control_timeout=60, layout="node-shared")

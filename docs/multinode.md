@@ -13,6 +13,10 @@ Host DRAM 访问权限及 CANN/HDK/灵衢版本。普通 RoCE 多机不在该测
 严格要求每台机器一块实际 DRAM 由本机两个 NPU 共同访问时，两个节点均添加
 `--layout node-shared`，详见 [共享 DRAM 六窗口测试](node-shared.md)。下文未加该选项的命令仍使用默认 rank-private 布局。
 
+**只依赖已安装 CANN 时，优先按该文档的 A/B 完整命令运行 `--layout node-shared --mode acl`。**
+它包含 CPU ACL、NPU kernel 和同窗口交接，不需要 GitCode HIXL 源码或实验桥。
+下文保留 HIXL API 与旧 combined 实验的操作步骤，不能把 ACL 的通过记成 HIXL API 的通过。
+
 ## 1. 在每个节点准备相同源码和配置
 
 目标节点不必联网。提前传入仓库源码包，在每台机器上使用已安装 SDK 编译。

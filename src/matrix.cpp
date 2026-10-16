@@ -293,7 +293,7 @@ struct FabricDescriptors {
 class KernelViews {
  public:
   KernelViews() = default;
-  void Initialize(Endpoint &ep, int rank) {
+  void Initialize(Endpoint &ep, int rank, bool host_device_alias = false) {
     rank_ = rank;
     addresses_.resize(gWorld * 2);
     imported_.resize(gWorld * 2);
@@ -326,17 +326,29 @@ class KernelViews {
       }
     }
     auto descriptors = gGroup->AllGather(local);
+    if (host_device_alias) {
+      // SDMA Fabric endpoints need non-UC device VAs, including an alias of our Host DRAM.
+      // Reserve one arena, map the same exported allocations, and never allocate another PA.
+      // The public API requires a 1 GiB multiple. This reserves VA only, not 1 GiB of PA.
+      Check(aclrtReserveMemAddressNoUCMemory(&fabric_arena_, 1024UL * 1024 * 1024, 0,
+              reinterpret_cast<void *>(40UL * 1024 * 1024 * 1024 * 1024), 0), "reserve ACL Fabric device VA arena");
+    }
     for (int peer = 0; peer < gWorld; ++peer) {
-      if (peer == rank) continue;
       for (int kind = 0; kind < 2; ++kind) {
+        if (peer == rank && !(host_device_alias && kind == 0)) continue;
         if (!descriptors[peer].valid[kind]) continue;
         const int index = peer * 2 + kind;
         Check(aclrtMemImportFromShareableHandleV2(&descriptors[peer].handles[kind],
                 ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, 0, &imported_[index]), "import kernel Fabric handle");
-        Check(aclrtReserveMemAddress(&remote_va_[index], kBytes, 0, nullptr, 1), "reserve kernel peer VA");
+        if (fabric_arena_) remote_va_[index] = static_cast<char *>(fabric_arena_) + index * kBytes;
+        else Check(aclrtReserveMemAddress(&remote_va_[index], kBytes, 0, nullptr, 1), "reserve kernel peer VA");
         Check(aclrtMapMem(remote_va_[index], kBytes, 0, imported_[index], 0), "map kernel peer VA");
         mapped_[index] = true;
         addresses_[index] = remote_va_[index];
+        if (peer == rank) {
+          std::printf("ACL_HOST_ALIAS rank=%d original=%p device_alias=%p same_allocation=true\n",
+                      rank, ep.buffers_[kind], addresses_[index]);
+        }
       }
     }
     library_ = dlopen(gKernelLibrary.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -350,7 +362,8 @@ class KernelViews {
       for (int peer = 0; peer < gWorld; ++peer) {
         if (gNodeOwners[peer] == peer) {
           std::printf("SHARED_DRAM_VIEW rank=%d owner=%d address=%p source=%s\n",
-                      rank, peer, addresses_[peer * 2], peer == rank ? "OWNER" : "IMPORTED");
+                      rank, peer, addresses_[peer * 2],
+                      peer == rank ? (host_device_alias ? "OWNER_DEVICE_ALIAS" : "OWNER") : "IMPORTED");
         }
       }
     }
@@ -362,6 +375,29 @@ class KernelViews {
     const void *src = static_cast<char *>(addresses_[source]) + source_offset;
     if (launch_(dst, src, bytes, stream_) != 0) throw std::runtime_error("kernel launch wrapper failed");
     Check(aclrtSynchronizeStreamWithTimeout(stream_, kTimeoutMs), "kernel stream complete");
+  }
+
+  void HostCopy(int source, int destination, size_t bytes, size_t source_offset,
+                size_t target_offset, bool async) {
+    void *dst = static_cast<char *>(addresses_.at(destination)) + target_offset;
+    const void *src = static_cast<char *>(addresses_.at(source)) + source_offset;
+    // Fabric device VAs use SDMA D2D, even when the underlying allocation is Host DRAM.
+    // A synchronous domain request is async submission followed by a blocking completion wait.
+    Check(aclrtMemcpyAsync(dst, bytes, src, bytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream_), "shared ACL copy submit");
+    if (async) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kTimeoutMs);
+      while (true) {
+        aclrtStreamStatus status = ACL_STREAM_STATUS_NOT_READY;
+        Check(aclrtStreamQuery(stream_, &status), "shared ACL completion query");
+        if (status == ACL_STREAM_STATUS_COMPLETE) break;
+        if (status != ACL_STREAM_STATUS_NOT_READY || std::chrono::steady_clock::now() >= deadline) {
+          throw std::runtime_error("ACL async stream failed or timed out");
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+      }
+    }
+    // Also propagates task errors when a completion query reports that the stream is idle.
+    Check(aclrtSynchronizeStreamWithTimeout(stream_, kTimeoutMs), "shared ACL complete");
   }
 
   void CheckRegisteredReleaseGuard() {
@@ -381,11 +417,16 @@ class KernelViews {
     for (size_t index = 0; index < remote_va_.size(); ++index) {
       if (mapped_[index]) { Check(aclrtUnmapMem(remote_va_[index]), "unmap kernel peer"); mapped_[index] = false; }
       if (remote_va_[index]) {
-        Check(aclrtReleaseMemAddress(remote_va_[index]), "release kernel peer VA"); remote_va_[index] = nullptr;
+        if (!fabric_arena_) Check(aclrtReleaseMemAddress(remote_va_[index]), "release kernel peer VA");
+        remote_va_[index] = nullptr;
       }
       if (imported_[index]) {
         Check(aclrtFreePhysical(imported_[index]), "release imported PA"); imported_[index] = nullptr;
       }
+    }
+    if (fabric_arena_) {
+      Check(aclrtReleaseMemAddress(fabric_arena_), "release ACL Fabric device VA arena");
+      fabric_arena_ = nullptr;
     }
   }
 
@@ -417,6 +458,7 @@ class KernelViews {
   std::vector<aclrtDrvMemHandle> imported_;
   std::vector<void *> remote_va_;
   std::vector<bool> mapped_;
+  void *fabric_arena_ = nullptr;
   void *library_ = nullptr;
   Launch launch_ = nullptr;
   aclrtStream stream_ = nullptr;
@@ -425,7 +467,7 @@ class KernelViews {
   void *acquired_[2]{};
 };
 
-struct Counts { int hixl = 0; int kernel = 0; int handoff = 0; int shared = 0; };
+struct Counts { int hixl = 0; int kernel = 0; int handoff = 0; int shared = 0; int acl = 0; };
 
 void Baseline(Endpoint &ep, int rank) {
   for (bool to_hbm : {true, false}) {
@@ -549,7 +591,10 @@ void Run(int rank, const std::string &mode) {
   if (gNodeShared) SharedBaseline(ep, rank);
   else Baseline(ep, rank);
   bool hixl = mode == "hixl" || mode == "combined";
-  bool kernel = mode == "kernel" || mode == "combined";
+  bool kernel = mode == "kernel" || mode == "combined" || mode == "acl";
+  if (mode == "acl") {
+    std::printf("CANN_ACL_ONLY rank=%d hixl_engine=DISABLED experimental_bridge=DISABLED\n", rank);
+  }
   auto identities = gGroup->AllGather(ep.peer_);
   for (int peer = 0; peer < rank; ++peer) {
     if (identities[peer].physical == ep.peer_.physical &&
@@ -557,7 +602,7 @@ void Run(int rank, const std::string &mode) {
       throw std::runtime_error("ranks on the same host use the same physical NPU");
     }
   }
-  if (kernel) views.Initialize(ep, rank);
+  if (kernel) views.Initialize(ep, rank, mode == "acl");
   if (hixl) ep.InitializeEngine();
   if (mode == "combined") views.CheckRegisteredReleaseGuard();
   auto peers = gGroup->AllGather(ep.peer_);
@@ -589,8 +634,10 @@ void Run(int rank, const std::string &mode) {
   delete views_owner;
   delete owner;
   if (gNodeShared) {
-    std::printf("RANK_PASS rank=%d hixl_cases=%d kernel_cases=%d handoff_cases=%d shared_cases=%d layout=node-shared cleanup=PASS\n",
+    std::printf("RANK_PASS rank=%d hixl_cases=%d kernel_cases=%d handoff_cases=%d shared_cases=%d",
                 rank, counts.hixl, counts.kernel, counts.handoff, counts.shared);
+    if (mode == "acl") std::printf(" acl_cases=%d", counts.acl);
+    std::printf(" layout=node-shared cleanup=PASS\n");
   } else {
     std::printf("RANK_PASS rank=%d hixl_cases=%d kernel_cases=%d handoff_cases=%d cleanup=PASS\n",
                 rank, counts.hixl, counts.kernel, counts.handoff);
@@ -637,14 +684,15 @@ int main(int argc, char **argv) {
     }
     if (gWorld < 1 || gWorld > 64 || rank < 0 || rank >= gWorld || gDevice < 0 || gNuma < -1 ||
         timeout < 1 || timeout > 3600 || session.size() != 64 || coordinator.empty() ||
-        (mode != "baseline" && mode != "hixl" && mode != "kernel" && mode != "combined") ||
+        (mode != "baseline" && mode != "hixl" && mode != "kernel" && mode != "combined" && mode != "acl") ||
         (mode != "baseline" && gWorld < 2) ||
-        ((mode == "kernel" || mode == "combined") && gKernelLibrary.empty())) {
+        ((mode == "kernel" || mode == "combined" || mode == "acl") && gKernelLibrary.empty())) {
       throw std::runtime_error("invalid/missing options; use scripts/run.py");
     }
     if (gNodeShared && (gNodeOwner < 0 || gNodeOwner > rank || !gRawVmm)) {
       throw std::runtime_error("node-shared requires a valid node owner and the vmm allocator");
     }
+    if (mode == "acl" && !gNodeShared) throw std::runtime_error("acl mode requires node-shared layout");
     gDomainHandles = mode == "combined";
     struct Settings { char session[65]{}; char mode[16]{}; uint32_t handle_size; uint32_t pointer_size; uint32_t endian; };
     Settings settings{};

@@ -9,6 +9,12 @@
 > 普通以太网/RoCE 多机不能直接视为 FabricMem 环境。本仓库固定启用 FabricMem，不做协议回退。
 > `combined` 是实验模式，需要额外桥接补丁；已安装原版 HIXL 不代表该模式可以直接运行。
 
+**只使用已安装 CANN/驱动验证完整 CPU＋NPU 共享域时，使用 `--layout node-shared --mode acl`。**
+CPU 使用公开 ACL 同步/异步拷贝，NPU 使用真实 AIV kernel，访问同一组唯一 DRAM/HBM；
+不需要下载 GitCode HIXL、编译适配库或调用实验桥。所链接的 HIXL/ACL 库直接来自 CANN 安装目录，
+例如 `/usr/local/Ascend/cann-9.0.0/lib64`；本模式不初始化 HIXL，不能记成 HIXL API 传输通过。
+A/B 两机完整命令见 [系统 CANN 共享域测试](docs/node-shared.md)。
+
 本仓库已执行的检查、SDK 适配及未验证项目见 [验证记录](docs/validation.md)。
 
 **严格验证同机两个 NPU 共用一块 DRAM 时，使用 `--layout node-shared`，见 [共享 DRAM 六窗口测试](docs/node-shared.md)。**
@@ -27,6 +33,7 @@ NPU kernel 使用真实 AIV MTE（GM→UB→GM）主动访问映射后的所有�
 | `hixl`（默认） | 所有 rank 对之间 DRAM/HBM 的 READ/WRITE，同步和异步完成 | 原版支持 FabricMem 的 HIXL；不要求实验接口 |
 | `kernel` | 每个 NPU 主动搬运任意两个不同窗口之间的数据 | ACL VMM Fabric 导入/导出；不初始化 HIXL，不能算 HIXL 传输通过 |
 | `combined` | 同一组物理窗口的 HIXL、kernel、跨后端交接与生命周期 | 本仓库的可选 beta2 实验桥，见 [实验说明](docs/experimental.md) |
+| **`acl`**（仅 node-shared） | CPU ACL＋NPU kernel 完整矩阵、共享 DRAM 访问与交接 | 仅已安装 CANN 的 ACL/Fabric 能力，不初始化 HIXL、不需要补丁 |
 
 每次操作前更换数据花纹，操作后逐字节检查所有 owner 的完整窗口，包括源和目标区间外 guard。
 测试长度为 4 KiB、64 KiB；默认 rank-private 布局的源偏移为 256 B、目标偏移为 512 B。
@@ -48,7 +55,7 @@ NPU stream、HIXL completion 和 CPU 校验都有实际返回状态检查。
 - Linux、Atlas A3；多机必须由管理员配置在同一 HCCS/Fabric 超节点内。
 - FabricMem 官方基线：HDK ≥25.5、灵衢 ≥1.5.0、CANN ≥9.0。版本号本身不保证硬件组网满足条件。
 - 已安装的 HIXL/CANN **开发头文件和共享库**、g++（C++17）、Python ≥3.8。
-- `kernel` / `combined` 另需 CANN 的 bisheng 与 AscendC 头文件；当前 kernel 目标为 `dav-c220-vec`。
+- `kernel` / `combined` / `acl` 另需 CANN 的 bisheng 与 AscendC 头文件；当前 kernel 目标为 `dav-c220-vec`。
 - 本机与各远端环境使用匹配的 CANN、驱动、HIXL，运行账号具有设备和 Fabric 内存权限。
 - 实测基线为 CANN 9.0、26.0.rc1 驱动、HIXL v9.1.0-beta.2 及隔离适配；新版 SDK 尚不能据此宣称验证通过。
 
@@ -56,6 +63,20 @@ CPU 参与是“CPU worker 管理真实 DRAM 并发起域操作”。
 本仓库每个 rank 都有 NPU，不验证纯 CPU、无 NPU 服务器的加入，也不声称 CPU 能直接解引用远端 HBM 指针。
 
 ## 编译与单机快速开始
+
+推荐的系统 CANN 流程（设备与 NUMA 值按预约环境、现场拓扑替换）：
+
+```bash
+source /usr/local/Ascend/cann-9.0.0/set_env.sh
+export HIXL_INCLUDE_DIR="$ASCEND_HOME_PATH/include"
+export HIXL_LIB_DIR="$ASCEND_HOME_PATH/lib64"
+bash scripts/build.sh
+bash scripts/rank.sh single --devices 0,1 --numa-ids 0,2 --layout node-shared --mode baseline
+bash scripts/rank.sh single --devices 0,1 --numa-ids 0,2 --layout node-shared --mode kernel
+bash scripts/rank.sh single --devices 0,1 --numa-ids 0,2 --layout node-shared --mode acl
+```
+
+以下旧入口继续用于单独验证 HIXL API 与默认 rank-private 布局：
 
 ```bash
 # 将此路径换成实际安装位置。

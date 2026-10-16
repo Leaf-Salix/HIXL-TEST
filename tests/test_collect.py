@@ -97,3 +97,27 @@ class CollectTests(unittest.TestCase):
         self.change(self.directories[1], model=dict(cpu_owners=[0], windows=[]))
         with self.assertRaises(ValueError):
             collector.collect(self.directories)
+
+    def test_acl_collects_separate_host_count_and_requires_acl_evidence(self):
+        self.enable_shared()
+        for rank, directory in enumerate(self.directories):
+            self.change(directory, mode="acl", session=collector.runner.digest(self.config, "acl", "vmm", "node-shared"))
+            path = directory / f"rank-{rank}.log"
+            lines = path.read_text().splitlines()[:-1]
+            lines += [f"CANN_ACL_ONLY rank={rank} hixl_engine=DISABLED experimental_bridge=DISABLED"]
+            lines += [f"ACL_HOST_ALIAS rank={rank} same_allocation=true"]
+            for label, number in dict(NODE_KERNEL_CASE_PASS=16, SHARED_DRAM_VIEW=2,
+                                      NODE_HANDOFF_PASS=24 if rank == 0 else 0,
+                                      SHARED_GROUP_PASS=8 if rank == 0 else 0).items():
+                lines += [label + " "] * number
+            for route, number in dict(ACL_SYNC=12, ACL_ASYNC=12, CPU_MEMMOVE=8).items():
+                lines += [f"HOST_CASE_PASS id=example path={route} guards=PASS"] * number
+            lines += [f"RANK_PASS rank={rank} hixl_cases=0 kernel_cases=32 handoff_cases=24 shared_cases=8 acl_cases=64 layout=node-shared cleanup=PASS"]
+            path.write_text("\n".join(lines))
+        result = collector.collect(self.directories)
+        self.assertEqual(result["expected_global"]["acl_cases"], 64)
+        self.assertEqual(result["expected_global"]["hixl_cases"], 0)
+        log = self.directories[1] / "rank-1.log"
+        log.write_text(log.read_text().replace("path=ACL_ASYNC", "path=HIXL", 1))
+        with self.assertRaises(ValueError):
+            collector.collect(self.directories)

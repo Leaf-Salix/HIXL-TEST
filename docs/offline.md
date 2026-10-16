@@ -61,6 +61,11 @@ bash scripts/build.sh
 `combined` 需要可选实验库，其离线源码依赖另见 [实验桥说明](experimental.md)。
 不想改动原版 HIXL 时，先完成 hixl/kernel 两类独立测试，保留各自的能力结论。
 
+完整 CPU＋NPU 同窗口验证已有无需实验库的入口：`--layout node-shared --mode acl`。
+使用 CANN 安装中的 include/lib64，直接调用 ACL Fabric、拷贝与流完成接口，并运行真实 AIV kernel。
+只需传入本测试仓库源码，不需要传入 GitCode HIXL 源码或其第三方构建依赖。
+单机及 A/B 双机完整命令见 [系统 CANN 共享域测试](node-shared.md)。
+
 ## 结果带出
 
 结果中包含现场地址、路径、主机名和内存句柄，仅通过现场允许的通道带出。

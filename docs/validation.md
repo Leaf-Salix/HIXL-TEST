@@ -64,6 +64,36 @@
 旧默认布局的用户双机通过记录保留；新版 node-shared 双机六窗口、280 项矩阵尚未运行。
 运行方法及计数见 [node-shared](node-shared.md)。
 
+## 系统 CANN-only ACL 模式单机实测
+
+2026-10-16，新增 `--layout node-shared --mode acl`，经 task-submit 预约单机两卡通过。
+构建使用 CANN 9.0 安装中的头文件和库；运行时核对 `libcann_hixl.so`、`libllm_datadist.so`、
+`libascendcl.so` 均解析到该系统 CANN 安装目录，没有加载 GitCode 构建的适配库。
+不初始化 HIXL engine，不调用实验桥；这是 ACL Fabric＋SDMA＋AIV 的测试结论。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| node-shared baseline | 两 rank 通过，仍只有一块真实 DRAM 和两块 HBM |
+| 独立 kernel 回归 | 24 个访问＋4 个 NPU 交接＋4 个共享访问组，通过 |
+| 完整 acl | 24 个 CPU 访问＋24 个 NPU 访问＋12 个交接＋4 个共享访问组，共 64 项通过 |
+| HIXL API 传输 | 不执行，`hixl_cases=0` |
+| 软件检查 | 30 项 UT 通过，含 ACL 计数、后端/同步异步路径证据与全局汇总拒绝检查 |
+
+同一 Fabric token 在非 UC 设备 VA arena 中建立映射，包含唯一 DRAM 的自导入别名；
+Host SDMA 与 AIV 共同使用这些映射，不新增物理 DRAM/HBM 或中转数据副本。
+1 GiB arena 只是虚拟地址预约；实际域内物理分配仍是三个 2 MiB 窗口。
+同步域请求通过 `aclrtMemcpyAsync`＋流同步完成；异步请求先流状态轮询，再同步检查任务错误。
+不是将 `aclrtMemcpy` 对所有导入地址的支持记成通过。自身 DRAM 的访问使用真实 CPU memmove。
+
+调试中普通 VA 的远端 HBM 异步拷贝报过 507001，同步拷贝对另一种别名报过 207000，
+小于 1 GiB 的 NoUCMemory 预约报过参数错误；这些失败保留为诊断证据，不计入成功结果。
+最终实现按设备 Fabric VA、公开预约粒度与 SDMA 完成流程通过，无静默回退。
+NoUCMemory 指定地址和同进程导出/自导入组合的版本边界见 [共享域说明](node-shared.md)，
+当前结论不能推广到其他 SDK、所有拓扑或生产级稳定性。
+
+**ACL-only 双机六窗口、280 项尚待现场真机运行**；旧的用户双机四模式反馈不替代该项。
+完整 A/B 命令已更新为系统 CANN 的 baseline → kernel → acl 三轮。
+
 ## 单机原版与适配不能混淆
 
 现场原版 HIXL 在设备配置文件存在但不可读时初始化失败。
