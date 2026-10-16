@@ -78,7 +78,8 @@ HIXL `TransferSync` 返回成功、`TransferAsync` 轮询到 `COMPLETED` 后，�
 使用 MTE 完成事件、pipeline barrier 和实际 stream synchronize，再由各 owner 检查完整窗口。
 
 `kernel` 通过表示 ACL Fabric 映射 + 真实 AIV 访问通过，不能记成 HIXL API 传输通过。
-多机上尚无本仓库实测结果；可能暴露单机没有的拓扑/权限/指令访问限制，应保留失败日志。
+2026-10-16 用户反馈，按仓库 A/B 双机示例运行的四种模式均 `GLOBAL_PASS`，包含本节真实 AIV 跨机访问。
+这是用户真机实测反馈，原始日志及现场版本未随反馈提供；其他拓扑/版本仍需实际运行验证，详见 [验证记录](validation.md)。
 
 ## 5. 验证同窗口跨后端交接（可选）
 
@@ -97,7 +98,7 @@ HIXL `TransferSync` 返回成功、`TransferAsync` 轮询到 `COMPLETED` 后，�
 ## 6. 可选 mpirun 启动
 
 MPI 仅提供启动和 rank 编号；测试仍使用同一个元数据控制连接，数据不经过 MPI。
-需要现场已有 Open MPI/MPICH。该入口的 rank 选择做过 UT，尚未做真实 MPI/多机硬件运行。
+需要现场已有 Open MPI/MPICH。该入口的 rank 选择做过 UT；用户已反馈双机四种模式通过，但未说明采用手动启动还是 MPI，不能据此单独确认此 MPI 入口已经实机验证。
 
 所有节点使用相同绝对仓库路径，先保证远程 shell 能加载 CANN/HIXL。
 Open MPI hostfile 例子：

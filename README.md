@@ -5,7 +5,7 @@
 目标机器已安装 HIXL/CANN；测试运行与编译均不访问公网，不依赖 PyPTO、simpler、pip 或 MPI。
 可选择 `mpirun` 启动，MPI 不承载测试数据。
 
-> 状态：单机两卡做过实机验证。多机程序、全窗口矩阵和说明已提供，但尚无多机硬件验证结果。
+> 状态：单机两卡做过实机验证；2026-10-16 用户反馈，按仓库 A/B 双机示例运行的 baseline、hixl、kernel、combined 四种模式全部 `GLOBAL_PASS`。双机结果及证据来源见 [验证记录](docs/validation.md)。
 > 普通以太网/RoCE 多机不能直接视为 FabricMem 环境。本仓库固定启用 FabricMem，不做协议回退。
 > `combined` 是实验模式，需要额外桥接补丁；已安装原版 HIXL 不代表该模式可以直接运行。
 
@@ -138,7 +138,7 @@ python3 scripts/collect.py /path/to/node-a-result /path/to/node-b-result
 ## 已知边界与故障排查
 
 - 验证显式完成后的可见性，不验证全局缓存一致性、远端原子操作、并发无锁队列、故障恢复或峰值带宽。
-- 自定义 kernel 的跨机访问尚未实测。Host/AICPU 展开 SDMA 通过不等于业务 AIV kernel 通过。
+- 用户反馈双机 `kernel` 与 `combined` 均通过，覆盖真实 AIV 跨机访问及同窗口跨后端交接；不能只用 Host/AICPU 展开 SDMA 通过代替这些验证。
 - HIXL 可使用 TCP 建链；本测试也有独立 TCP 控制面。数据矩阵不通过 TCP 控制连接传输。
 - `coordinator bind/listen failed`：控制 IP 不在 rank0 本机、端口占用或权限错误。单机默认自动选控制端口；可用 `--port` 和 `--engine-port-base` 覆盖端口。
 - `Hixl::Initialize` 失败：检查 HIXL 环境、设备 IP/配置可读性。旧 beta2 在配置存在但不可读时可能失败，实验补丁含兼容修复；不要靠伪造 IP 或改共享系统权限绕过。
