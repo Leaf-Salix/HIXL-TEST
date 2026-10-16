@@ -1,0 +1,7 @@
+{
+  "coordinator": "198.51.100.10:39000",
+  "nodes": [
+    {"name": "node-a", "ip": "198.51.100.10", "devices": [0, 1], "engine_port_base": 39100},
+    {"name": "node-b", "ip": "198.51.100.11", "devices": [0, 1], "engine_port_base": 39100}
+  ]
+}

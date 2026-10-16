@@ -1,0 +1,10 @@
+/build/
+/results/
+/dist/
+/.ccache/
+__pycache__/
+*.pyc
+.DS_Store
+._*
+/configs/site.json
+*.env

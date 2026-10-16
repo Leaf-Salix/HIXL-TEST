@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: offline-check
+        name: Offline source and script checks
+        entry: python3 scripts/check.py
+        language: system
+        pass_filenames: false
+        always_run: true

@@ -1,0 +1,5 @@
+{
+  "src/hixl/common/hixl_utils.cc": "19d94a501e928b5a0b27ae8f8bc73eb1a28f4150db02e1db66c51c3f706f25ea",
+  "src/llm_datadist/adxl/fabric_mem_transfer_service.cc": "6ce54a1432547de9402f9aa9e75db6d5e08e3a48527db9cbf52b0e675ceafa32",
+  "src/llm_datadist/adxl/channel.h": "03723694dbbaf3e02a747890a56dbb6c8a3fc6dfd6a1bfe9e368836ba0034e74"
+}

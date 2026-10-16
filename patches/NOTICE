@@ -1,0 +1,6 @@
+补丁基于 CANN HIXL v9.1.0-beta.2，commit 2b7a38e6052ce92413141158453a7e3a9c929f7f。
+上游：https://gitcode.com/cann/hixl
+Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
+补丁所含上游代码受本目录 CANN-LICENSE（CANN Open Software License Agreement Version 2.0）约束。
+实验改动：配置不可读时使用已有公开查询路径；共享窗口单次导出与生命周期管理。
+这些改动不是官方接口，不属于上游发布版本。

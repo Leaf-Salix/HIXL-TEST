@@ -1,0 +1,5 @@
+HIXL-TEST 的原始测试代码与文档适用根目录 MIT LICENSE。
+patches/hixl-v9.1.0-beta.2-domain.patch 包含 CANN HIXL 的修改片段，
+该部分遵循 patches/CANN-LICENSE（CANN Open Software License Agreement Version 2.0），
+并保留 patches/NOTICE 中列出的上游版权与来源。
+HIXL、CANN、驱动、SDK、第三方构建依赖及二进制均未包含在本仓库中。

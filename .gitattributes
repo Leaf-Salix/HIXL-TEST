@@ -1,0 +1,3 @@
+# Preserve upstream license bytes and the mandatory single-space patch context markers.
+patches/*.patch -whitespace
+patches/CANN-LICENSE -whitespace

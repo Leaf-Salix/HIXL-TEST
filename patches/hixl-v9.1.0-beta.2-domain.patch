@@ -1,0 +1,230 @@
+--- a/src/hixl/common/hixl_utils.cc
++++ b/src/hixl/common/hixl_utils.cc
+@@ -17,6 +17,7 @@
+ #include <cstring>
+ #include <fstream>
+ #include <unordered_set>
++#include <unistd.h>
+ #include "nlohmann/json.hpp"
+ #include "securec.h"
+ #include "acl/acl.h"
+@@ -134,7 +135,7 @@
+ Status GetDeviceIp(int32_t phy_device_id, std::string &device_ip) {
+   char resolved_path[MMPA_MAX_PATH] = {};
+   auto mm_ret = mmRealPath(kHccnConfPath, resolved_path, MMPA_MAX_PATH);
+-  if (mm_ret == EN_OK) {
++  if (mm_ret == EN_OK && access(resolved_path, R_OK) == 0) {
+     HIXL_CHK_BOOL_RET_STATUS(mmAccess(resolved_path) == EN_OK, FAILED, "Can not access file:%s, reason:%s",
+                              resolved_path, strerror(errno));
+ 
+@@ -158,7 +159,7 @@
+       return SUCCESS;
+     }
+   } else {
+-    HIXL_LOGI("%s does not exist, trying to use hccn_tool to get device_ip.", kHccnConfPath);
++    HIXL_LOGI("%s does not exist or is not readable, trying to use hccn_tool to get device_ip.", kHccnConfPath);
+     std::string ip;
+     HIXL_CHK_STATUS_RET(GetIpAddressFromHccnTool(static_cast<uint32_t>(phy_device_id), ip),
+                         "Getting ip from hccn tool failed.");
+--- a/src/llm_datadist/adxl/channel.h
++++ b/src/llm_datadist/adxl/channel.h
+@@ -35,6 +35,7 @@
+   aclrtDrvMemHandle imported_handle;
+   uintptr_t imported_va;
+   bool is_retained;
++  bool is_domain_window = false;
+ };
+ 
+ enum class ChannelType {
+--- a/src/llm_datadist/adxl/fabric_mem_transfer_service.cc
++++ b/src/llm_datadist/adxl/fabric_mem_transfer_service.cc
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include "fabric_mem_transfer_service.h"
++#include "hixl/experimental_domain_window.h"
+ #include <chrono>
+ #include <mutex>
+ #include "adxl/adxl_utils.h"
+@@ -30,8 +31,82 @@
+ 
+ std::mutex g_va_to_pa_mutex;
+ std::unordered_map<uintptr_t, aclrtDrvMemHandle> g_va_to_pa_handle_map;
++
++// Explicit window lifetime: the cache owns a retained PA reference until Release.
++// VA mappings and all imported mappings remain the caller's responsibility.
++struct DomainWindow {
++  size_t len;
++  aclrtDrvMemHandle pa_handle;
++  aclrtMemFabricHandle fabric;
++  size_t registrations = 0;
++};
++std::mutex g_domain_mutex;
++std::unordered_map<uintptr_t, DomainWindow> g_domain_windows;
++
++Status RetainDomainRegistration(uintptr_t addr, size_t len, aclrtDrvMemHandle &pa,
++                                aclrtMemFabricHandle &fabric, bool &found) {
++  std::lock_guard<std::mutex> lock(g_domain_mutex);
++  auto it = g_domain_windows.find(addr);
++  found = it != g_domain_windows.end();
++  if (!found) {
++    return SUCCESS;
++  }
++  ADXL_CHK_BOOL_RET_STATUS(it->second.len == len, PARAM_INVALID, "Domain window length mismatch.");
++  ++it->second.registrations;
++  pa = it->second.pa_handle;
++  fabric = it->second.fabric;
++  return SUCCESS;
++}
++
++void DropDomainRegistration(uintptr_t addr) {
++  std::lock_guard<std::mutex> lock(g_domain_mutex);
++  auto it = g_domain_windows.find(addr);
++  if (it != g_domain_windows.end() && it->second.registrations > 0) {
++    --it->second.registrations;
++  }
++}
+ }  // namespace
++
++extern "C" uint32_t HixlDomainWindowAcquire(void *addr, size_t len, aclrtMemFabricHandle *out) {
++  ADXL_CHK_BOOL_RET_STATUS(addr != nullptr && len > 0 && out != nullptr, PARAM_INVALID,
++                           "Invalid domain window arguments.");
++  const uintptr_t base = llm::PtrToValue(addr);
++  std::lock_guard<std::mutex> lock(g_domain_mutex);
++  auto it = g_domain_windows.find(base);
++  if (it != g_domain_windows.end()) {
++    ADXL_CHK_BOOL_RET_STATUS(it->second.len == len, PARAM_INVALID, "Domain window length mismatch.");
++    *out = it->second.fabric;
++    return SUCCESS;
++  }
++  ADXL_CHK_BOOL_RET_STATUS(base <= UINTPTR_MAX - len, PARAM_INVALID, "Domain window address overflow.");
++  for (const auto &entry : g_domain_windows) {
++    ADXL_CHK_BOOL_RET_STATUS(base + len <= entry.first || entry.first + entry.second.len <= base,
++                             PARAM_INVALID, "Overlapping domain windows are unsupported.");
++  }
++  aclrtDrvMemHandle pa = nullptr;
++  ADXL_CHK_ACL_RET(aclrtMemRetainAllocationHandle(addr, &pa));
++  LLM_DISMISSABLE_GUARD(fail_guard, ([&pa] { LLM_CHK_ACL(aclrtFreePhysical(pa)); }));
++  aclrtMemFabricHandle fabric{};
++  ADXL_CHK_ACL_RET(aclrtMemExportToShareableHandleV2(pa, ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION,
++                                                   ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, &fabric));
++  g_domain_windows.emplace(base, DomainWindow{len, pa, fabric, 0});
++  *out = fabric;
++  LLM_DISMISS_GUARD(fail_guard);
++  return SUCCESS;
++}
+ 
++extern "C" uint32_t HixlDomainWindowRelease(void *addr) {
++  ADXL_CHK_BOOL_RET_STATUS(addr != nullptr, PARAM_INVALID, "Null domain window.");
++  std::lock_guard<std::mutex> lock(g_domain_mutex);
++  auto it = g_domain_windows.find(llm::PtrToValue(addr));
++  ADXL_CHK_BOOL_RET_STATUS(it != g_domain_windows.end(), PARAM_INVALID, "Unknown domain window.");
++  ADXL_CHK_BOOL_RET_STATUS(it->second.registrations == 0, RESOURCE_EXHAUSTED,
++                           "Domain window still has active HIXL registrations.");
++  ADXL_CHK_ACL_RET(aclrtFreePhysical(it->second.pa_handle));
++  g_domain_windows.erase(it);
++  return SUCCESS;
++}
++
+ Status FabricMemTransferService::MallocMem(MemType type, size_t size, void **ptr) {
+   ADXL_CHK_BOOL_RET_STATUS(type == MemType::MEM_HOST, PARAM_INVALID, "Only support malloc host mem.");
+   ADXL_CHK_BOOL_RET_STATUS(size > 0, PARAM_INVALID, "size should be bigger than zero.");
+@@ -184,6 +259,9 @@
+         LLM_CHK_ACL(aclrtFreePhysical(share_handle.first));
+         LLMLOGI("Free retained handle:%p.", share_handle.first);
+       }
++      if (share_handle.second.is_domain_window) {
++        DropDomainRegistration(share_handle.second.va_addr);
++      }
+     }
+     share_handles_.clear();
+   }
+@@ -192,15 +270,23 @@
+ Status FabricMemTransferService::RegisterMem(const MemDesc &mem, MemType type, MemHandle &mem_handle) {
+   aclrtDrvMemHandle pa_handle = nullptr;
+   bool is_retained = false;
+-  auto status = GetPaHandleFromVa(mem.addr, pa_handle);
+-  if (status == FAILED) {
++  bool is_domain_window = false;
++  aclrtMemFabricHandle share_handle = {};
++  ADXL_CHK_STATUS_RET(RetainDomainRegistration(mem.addr, mem.len, pa_handle, share_handle, is_domain_window),
++                       "Failed to retain domain window registration.");
++  auto status = is_domain_window ? SUCCESS : GetPaHandleFromVa(mem.addr, pa_handle);
++  if (!is_domain_window && status == FAILED) {
+     ADXL_CHK_ACL_RET(aclrtMemRetainAllocationHandle(llm::ValueToPtr(mem.addr), &pa_handle));
+     is_retained = true;
+   }
+   aclrtDrvMemHandle imported_pa_handle = nullptr;
+   uintptr_t imported_va = 0;
+-  LLM_DISMISSABLE_GUARD(fail_guard, ([&pa_handle, &imported_va, &imported_pa_handle] {
+-                          if (pa_handle != nullptr) {
++  LLM_DISMISSABLE_GUARD(fail_guard, ([&pa_handle, &imported_va, &imported_pa_handle, is_retained,
++                                    is_domain_window, &mem] {
++                          if (is_domain_window) {
++                            DropDomainRegistration(mem.addr);
++                          }
++                          if (is_retained && pa_handle != nullptr) {
+                             LLM_CHK_ACL(aclrtFreePhysical(pa_handle));
+                           }
+                           if (imported_va != 0) {
+@@ -210,9 +296,13 @@
+                             LLM_CHK_ACL(aclrtFreePhysical(imported_pa_handle));
+                           }
+                           }));
+-  aclrtMemFabricHandle share_handle = {};
+-  ADXL_CHK_ACL_RET(aclrtMemExportToShareableHandleV2(pa_handle, ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION,
+-    ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, &share_handle));
++  std::lock_guard<std::mutex> registration_lock(share_handle_mutex_);
++  ADXL_CHK_BOOL_RET_STATUS(share_handles_.find(pa_handle) == share_handles_.end(), PARAM_INVALID,
++                           "Physical allocation is already registered with this engine.");
++  if (!is_domain_window) {
++    ADXL_CHK_ACL_RET(aclrtMemExportToShareableHandleV2(pa_handle, ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION,
++      ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, &share_handle));
++  }
+ 
+   // HOST addr need map to device
+   if (type == MEM_HOST) {
+@@ -227,9 +317,8 @@
+             mem.len, imported_pa_handle);
+   }
+ 
+-  std::lock_guard<std::mutex> lock(share_handle_mutex_);
+   share_handles_[pa_handle] = ShareHandleInfo{mem.addr, mem.len, share_handle, imported_pa_handle, imported_va,
+-                                              is_retained};
++                                              is_retained, is_domain_window};
+   mem_handle = pa_handle;
+   LLMLOGI("Export suc, mem type:%s, mem addr:%lu, retained:%d, handle:%p.",
+           hixl::MemTypeToString(static_cast<hixl::MemType>(type)).c_str(),
+@@ -263,6 +352,9 @@
+       LLM_CHK_ACL(aclrtFreePhysical(it->first));
+       LLMLOGI("Free retained handle:%p.", it->first);
+     }
++    if (it->second.is_domain_window) {
++      DropDomainRegistration(it->second.va_addr);
++    }
+     share_handles_.erase(it);
+   }
+   LLMLOGI("Success to deregister mem handle:%p.", mem_handle);
+diff --git a/include/hixl/experimental_domain_window.h b/include/hixl/experimental_domain_window.h
+new file mode 100644
+index 0000000..1a436ea
+--- /dev/null
++++ b/include/hixl/experimental_domain_window.h
+@@ -0,0 +1,17 @@
++// 实验接口：不属于官方 HIXL SDK。
++// 调用者持有并保持 addr 对应完整 VMM 分配及其原始映射，禁止子区间/别名登记。
++// Acquire 必须先于 HIXL RegisterMem 和其他 Fabric export；重复 Acquire 返回缓存句柄。
++// 释放顺序：停止通信和 kernel，HIXL Disconnect/Deregister/Finalize，销毁所有导入映射，
++// 然后 Release，最后由原所有者 unmap/free。Release 拒绝仍有 HIXL 注册的窗口。
++#ifndef HIXL_EXPERIMENTAL_DOMAIN_WINDOW_H_
++#define HIXL_EXPERIMENTAL_DOMAIN_WINDOW_H_
++
++#include <cstddef>
++#include <cstdint>
++#include "acl/acl.h"
++
++extern "C" __attribute__((visibility("default"))) uint32_t HixlDomainWindowAcquire(
++    void *addr, size_t len, aclrtMemFabricHandle *out);
++extern "C" __attribute__((visibility("default"))) uint32_t HixlDomainWindowRelease(void *addr);
++
++#endif
