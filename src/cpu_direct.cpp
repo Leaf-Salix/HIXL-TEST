@@ -1,6 +1,8 @@
 // Capability probe: CPU accesses remote DRAM only after explicit HOST access succeeds.
 // There are no stream, memcpy, kernel or DMA submission APIs in this executable.
 #include <acl/acl.h>
+#include <ascend_hal.h>
+#include <dlfcn.h>
 #include <signal.h>
 
 #include <atomic>
@@ -44,7 +46,7 @@ struct Access {
 
 class Memory {
  public:
-  void Open(int numa, int rank, control::Group &group, Peer &local) {
+  bool Open(int numa, int rank, control::Group &group, Peer &local) {
     aclrtPhysicalMemProp prop{};
     prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
     prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
@@ -61,11 +63,32 @@ class Memory {
       if (std::strcmp(peer.session, local.session)) throw std::runtime_error("source/config/run-ID mismatch");
     }
     std::printf("HOSTS same_host=%d\n", std::strcmp(peers[0].hostname, peers[1].hostname) == 0);
-    Check(aclrtMemImportFromShareableHandleV2(&peers[1 - rank].handle,
-        ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, 0, &imported_), "import remote Host DRAM");
+    // ACL V2 imports into the current NPU. A CPU view needs a Host-target handle,
+    // not a Device-target handle with HOST permission added afterwards.
+    library_ = dlopen("libascend_hal.so", RTLD_NOW | RTLD_LOCAL);
+    if (!library_) throw std::runtime_error("load installed libascend_hal.so failed");
+    auto host_id = reinterpret_cast<decltype(&halGetHostID)>(dlsym(library_, "halGetHostID"));
+    auto import = reinterpret_cast<decltype(&halMemImportFromShareableHandleV2)>(
+        dlsym(library_, "halMemImportFromShareableHandleV2"));
+    if (!host_id || !import) throw std::runtime_error("installed HAL Host import APIs missing");
+    uint32_t host = 0;
+    auto host_rc = host_id(&host);
+    if (host_rc != DRV_ERROR_NONE) throw std::runtime_error("get Host ID drv_rc=" + std::to_string(host_rc));
+    drv_mem_handle_t *handle = nullptr;
+    auto rc = import(MEM_HANDLE_TYPE_FABRIC,
+        reinterpret_cast<MemShareHandle *>(&peers[1 - rank].handle), host, &handle);
+    if (rc != DRV_ERROR_NONE && rc != DRV_ERROR_NOT_SUPPORT) {
+      throw std::runtime_error("Host-target import drv_rc=" + std::to_string(rc));
+    }
+    std::printf("HOST_IMPORT rank=%d target=HOST rc=%d ready=%d\n", rank,
+                rc == DRV_ERROR_NONE ? 0 : ACL_ERROR_RT_FEATURE_NOT_SUPPORT, rc == DRV_ERROR_NONE);
+    if (rc == DRV_ERROR_NOT_SUPPORT) return false;
+    // CANN Map/Free pass this native HAL handle through without wrapping it.
+    imported_ = reinterpret_cast<aclrtDrvMemHandle>(handle);
     // Ordinary VMM reservation, never reinterpret a NoUCMemory device arena as a CPU pointer.
     Check(aclrtReserveMemAddress(&remote_, kAllocation, 0, nullptr, 1), "reserve peer VA");
     Check(aclrtMapMem(remote_, kAllocation, 0, imported_, 0), "map imported DRAM");
+    return true;
   }
   Access RequestHostAccess() {
     Access result;
@@ -107,6 +130,7 @@ class Memory {
     }
   }
   void CloseImporter() {
+    if (!imported_) return;
     Check(aclrtUnmapMem(remote_), "unmap peer");
     Check(aclrtReleaseMemAddress(remote_), "release peer VA");
     Check(aclrtFreePhysical(imported_), "release imported handle");
@@ -115,10 +139,12 @@ class Memory {
     Check(aclrtUnmapMem(owner_), "unmap owner");
     Check(aclrtReleaseMemAddress(owner_), "release owner VA");
     Check(aclrtFreePhysical(physical_), "release owner physical memory");
+    if (library_ && dlclose(library_) != 0) throw std::runtime_error("close HAL library failed");
   }
  private:
   void *owner_ = nullptr;
   void *remote_ = nullptr;
+  void *library_ = nullptr;
   aclrtDrvMemHandle physical_ = nullptr;
   aclrtDrvMemHandle imported_ = nullptr;
 };
@@ -143,8 +169,8 @@ int main(int argc, char **argv) {
     Check(aclrtGetPhyDevIdByLogicDevId(device, &physical), "device ID");
     std::printf("DEVICE rank=%d logical=%d physical=%d numa=%d\n", rank, device, physical, numa);
     Memory memory;
-    memory.Open(numa, rank, group, local);
-    Access access = memory.RequestHostAccess();
+    bool imported = memory.Open(numa, rank, group, local);
+    Access access = imported ? memory.RequestHostAccess() : Access{};
     std::printf("HOST_ACCESS rank=%d set_rc=%d get_rc=%d flags=%llu ready=%d\n", rank,
                 access.set_rc, access.get_rc, static_cast<unsigned long long>(access.flags), access.ready);
     bool supported = true;

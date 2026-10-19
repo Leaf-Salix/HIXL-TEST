@@ -12,6 +12,7 @@ spec.loader.exec_module(probe)
 
 def log(rank, unsupported=False, local_ready=True):
     text = (f"DEVICE rank={rank} logical=0 physical=0 numa=0\nHOSTS same_host=0\n"
+            f"HOST_IMPORT rank={rank} target=HOST rc=0 ready=1\n"
             f"HOST_ACCESS rank={rank} " + ("set_rc=0 get_rc=0 flags=3 ready=1\n" if local_ready else
                                            "set_rc=207000 get_rc=-1 flags=0 ready=0\n"))
     if not unsupported:
@@ -44,6 +45,22 @@ class CpuDirectTests(unittest.TestCase):
     def test_fault_cannot_pass(self):
         with self.assertRaises(ValueError):
             probe.evidence(log(0) + "CPU_DIRECT_ACCESS_FAULT\n", 0, 0, 0, 0)
+
+    def test_host_target_import_required(self):
+        for changed in (log(0).replace("target=HOST", "target=DEVICE"),
+                        log(0).replace("HOST_IMPORT rank=0 target=HOST rc=0 ready=1\n", ""),
+                        log(0).replace("HOST_IMPORT rank=0", "HOST_IMPORT rank=1")):
+            with self.assertRaises(ValueError):
+                probe.evidence(changed, 0, 0, 0, 0)
+
+    def test_unsupported_import_skips_access_and_payload(self):
+        text = log(0, True, False).replace("rc=0 ready=1\n", "rc=207000 ready=0\n")
+        text = text.replace("set_rc=207000 get_rc=-1", "set_rc=-1 get_rc=-1")
+        self.assertEqual(probe.evidence(text, 0, 0, 0, 3)["import_access"]["ready"], 0)
+        for changed in (text.replace("rc=207000 ready=0", "rc=107000 ready=0"),
+                        text.replace("set_rc=-1", "set_rc=0")):
+            with self.assertRaises(ValueError):
+                probe.evidence(changed, 0, 0, 0, 3)
 
     def fixtures(self, root, unsupported=False):
         directories = []

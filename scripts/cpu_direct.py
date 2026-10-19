@@ -25,16 +25,23 @@ def save(path, data):
 def evidence(log, rank, device, numa, returncode):
     devices = re.findall(r"^DEVICE rank=(\d+) logical=(\d+) physical=(\d+) numa=(\d+)$", log, re.M)
     hosts = re.findall(r"^HOSTS same_host=([01])$", log, re.M)
+    imports = re.findall(r"^HOST_IMPORT rank=(\d+) target=HOST rc=(\d+) ready=([01])$", log, re.M)
     access = re.findall(r"^HOST_ACCESS rank=(\d+) set_rc=(-?\d+) get_rc=(-?\d+) flags=(\d+) ready=([01])$", log, re.M)
     results = re.findall(r"^CPU_DIRECT_RESULT rank=(\d+) status=(PASS|UNSUPPORTED) cleanup=PASS fallback=NONE$", log, re.M)
-    if len(devices) != 1 or len(hosts) != 1 or len(access) != 1 or len(results) != 1:
+    if len(devices) != 1 or len(hosts) != 1 or len(imports) != 1 or len(access) != 1 or len(results) != 1:
         raise ValueError("missing/duplicate endpoint/access/cleanup evidence")
     actual_rank, logical, physical, actual_numa = map(int, devices[0])
     if (actual_rank, logical, actual_numa) != (rank, device, numa) or int(access[0][0]) != rank or int(results[0][0]) != rank:
         raise ValueError("rank/device/NUMA mismatch")
     status = results[0][1]
+    import_rank, import_rc, import_ready = map(int, imports[0])
+    if import_rank != rank or (import_rc, import_ready) not in ((0, 1), (207000, 0)):
+        raise ValueError("invalid Host-target import evidence")
     set_rc, get_rc, flags, ready = map(int, access[0][1:])
-    if ready:
+    if not import_ready:
+        if (set_rc, get_rc, flags, ready) != (-1, -1, 0, 0):
+            raise ValueError("denied import must skip HOST access and CPU payload")
+    elif ready:
         if (set_rc, get_rc, flags) != (0, 0, 3):
             raise ValueError("ready without HOST READWRITE capability")
     elif not ((set_rc == 207000 and get_rc == -1) or (set_rc == 0 and get_rc == 207000)):
@@ -54,6 +61,7 @@ def evidence(log, rank, device, numa, returncode):
     if "CPU_DIRECT_FAIL" in log or "CPU_DIRECT_ACCESS_FAULT" in log:
         raise ValueError("runtime/CPU access failure")
     return dict(status=status, physical_device=physical, same_host=hosts[0] == "1",
+                import_access=dict(rc=import_rc, ready=import_ready, target="HOST"),
                 access=dict(zip(("set_rc", "get_rc", "flags", "ready"), map(int, access[0][1:]))), cases=cases)
 
 

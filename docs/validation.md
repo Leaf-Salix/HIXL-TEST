@@ -1,10 +1,19 @@
 # 验证记录与证据边界
 
-日期：2026-10-16（Asia/Shanghai）。
+日期：2026-10-19（Asia/Shanghai）。
 
-## CPU 原生 DRAM 能力探针：同机对照失败
+## CPU 原生 DRAM 能力探针：修正 import 目标后同机通过
 
-2026-10-16，经 task-submit 预约单卡，运行两个同机进程的 [CPU 原生访问能力探针](cpu-direct.md#同机双进程硬件对照fail)。
+2026-10-19，对照 CANN/旧 V2 驱动源码及真实 HAL 参数日志，确认旧 ACL V2 流程把 handle 导入当前 NPU，
+原探针却把它当成 Host-target 使用。改为系统 HAL 显式导入 `halGetHostID()` 返回的 Host 目标后，
+DEFAULT/FABRIC 的同机角色对照均通过；正式探针不加载诊断插件，双方完整四组 CPU READ/WRITE、
+每组 64 KiB 搬运、完整 2 MiB 与 guard、正常清理全部通过，退出码 0/0，汇总 `SINGLE_HOST_CPU_PASS`。
+这次修正未使用 DMA、kernel 或数据回退。跨机 Host-target 仍未验证，公开 V2 源码还有明确拒绝分支。
+根因、源码和版本边界见 [Host-target 修复记录](cpu-direct.md#2026-10-19-根因确认与-host-target-修复同机-pass)。
+
+以下保留修复前旧 Device-target 探针的失败和排查记录，不能用作当前同机能力不支持的结论。
+
+2026-10-16，经 task-submit 预约单卡，运行两个同机进程的旧 CPU 原生访问能力探针。
 两个进程的 Host SetAccess/GetAccess 均返回 0，查询权限为 READWRITE（flags=3），并进入 CPU 数据阶段。
 首组 CPU_A READ 对端 DRAM 时，rank0 在目标区首字节（偏移 1048576）校验不一致，
 随后 rank1 因控制连接 Broken pipe 退出。两 rank 均退出 1，零组 `CPU_CASE_PASS`，没有成功清理标记或成功 summary。
