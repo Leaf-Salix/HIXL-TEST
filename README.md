@@ -20,8 +20,10 @@ A/B 两机完整命令见 [系统 CANN 共享域测试](docs/node-shared.md)。
 文档包含 A、B 完整启动、导出和证据汇总命令。
 
 进一步区分“CPU 原生访问”与“NPU SDMA 搬运”，见 [CPU 远端 DRAM 能力探针](docs/cpu-direct.md)。
-已核查公开驱动拒绝 Host 跨机映射；新探针仅在显式 HOST 权限成功后尝试 CPU 读写，
-不支持则报告 `UNSUPPORTED`，不回退其他后端。文档含源码证据与 A/B 完整命令。
+修复后的显式 Host-target 流程已通过同机 CPU 原生读写；双机使用同一探针，
+A/B 更新、重编译、启动及汇总的完整命令见 [双机 Host-target 测试](docs/cpu-direct.md#两机完整命令)。
+已核查公开驱动拒绝 Host 跨机映射，现场双机能力仍待验证；探针仅在双方 Host 导入及权限均成功后读写，
+不支持则报告 `UNSUPPORTED`，不回退其他后端。
 
 本仓库已执行的检查、SDK 适配及未验证项目见 [验证记录](docs/validation.md)。
 

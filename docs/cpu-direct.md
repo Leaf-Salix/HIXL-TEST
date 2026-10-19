@@ -78,20 +78,35 @@ VA 预约沿用本仓库 CANN 9.0 现场的大页参数 `flags=1`，没有使用
 
 ## 两机完整命令
 
+**以下命令运行的是修复后的 Host-target 流程，和已通过的同机探针使用同一份 C++ 程序。**
+不需要另选 backend 或启用实验补丁；`cpu_direct_node.sh` → `cpu_direct.py run` → `build/cpu_direct`，
+双方均以本机 `halGetHostID()` 导入对端导出的 Fabric handle，然后才映射 Host VA、核对 HOST 权限。
+本项独立于 `--mode acl` 的 SDMA 测试，不要以之前 SDMA 的 `GLOBAL_PASS` 代替本项结果。
+
 两端位于同一 A3 HCCS/Fabric 超节点，各预约一张 NPU，CANN/驱动和权限满足原先 Fabric 测试条件。
 源码、run-ID、coordinator 完全一致；每次运行换新 run-ID，不复用输出目录。
 以下保留地址、路径、设备和 NUMA 都要按现场替换。
 
-### 1. A、B 分别编译
+### 1. A、B 分别更新和重新编译
+
+两端已有仓库时执行下列命令；没有仓库时先分别运行
+`git clone https://github.com/Leaf-Salix/HIXL-TEST.git /path/to/HIXL-TEST`。
+没有公网时，把同一份更新后的源码通过获准离线渠道分发到两端，跳过 `git pull`；
+使用 Git 归档、没有 `.git` 时也跳过 Git 命令。两端编译和测试本身不访问公网。
 
 **A：**
 
 ```bash
 export TEST_ROOT=/path/to/HIXL-TEST
 export CANN_ENV=/usr/local/Ascend/cann-9.0.0/set_env.sh
-export PYTHON_BIN=python3
+export PYTHON_BIN="$(command -v python3)"
 export PYTHONNOUSERSITE=1
+set -e
 cd "$TEST_ROOT"
+git switch main
+git pull --ff-only origin main
+git merge-base --is-ancestor f38f3562e2c75cf88c83557605cfe407998e3758 HEAD || { echo '缺少 Host-target 修复'; false; }
+git rev-parse HEAD
 source "$CANN_ENV"
 bash scripts/build_cpu_direct.sh
 ```
@@ -101,17 +116,24 @@ bash scripts/build_cpu_direct.sh
 ```bash
 export TEST_ROOT=/path/to/HIXL-TEST
 export CANN_ENV=/usr/local/Ascend/cann-9.0.0/set_env.sh
-export PYTHON_BIN=python3
+export PYTHON_BIN="$(command -v python3)"
 export PYTHONNOUSERSITE=1
+set -e
 cd "$TEST_ROOT"
+git switch main
+git pull --ff-only origin main
+git merge-base --is-ancestor f38f3562e2c75cf88c83557605cfe407998e3758 HEAD || { echo '缺少 Host-target 修复'; false; }
+git rev-parse HEAD
 source "$CANN_ENV"
 bash scripts/build_cpu_direct.sh
 ```
 
+上述命令按 Bash 执行，各步成功后再继续；核对 A、B 的 HEAD 相同。
 不需要 HIXL GitCode 源码、bisheng、MPI 或 Python 第三方包。显式链接系统 `libascendcl`、`libdl`，
 从已安装驱动动态加载 `libascend_hal.so`；使用 CANN 安装目录的 `include/driver` 头文件。
 该原生 HAL handle 经 ACL Map/Free 直传的组合已在本次安装栈验证，其他 SDK 版本仍需验证。
-launcher 校验 binary 和编译时源码摘要；更改 C++/头文件后必须重新编译。
+launcher 校验 binary 和编译时源码摘要；更改 C++/头文件后必须重新编译，不能沿用旧 `build/cpu_direct`。
+两端运行环境不要设置诊断用的 `LD_PRELOAD`。
 
 ### 2. A 配置，复制给 B
 
@@ -121,7 +143,7 @@ launcher 校验 binary 和编译时源码摘要；更改 C++/头文件后必须�
 cd "$TEST_ROOT"
 cat > configs/cpu-direct.env <<'ENV'
 export COORDINATOR=198.51.100.10:39501
-export RUN_ID=cpu-direct-20261016-run01
+export RUN_ID=cpu-host-target-20261019-run01
 ENV
 "${EDITOR:-vi}" configs/cpu-direct.env
 export B_SSH=user@node-b-hostname
@@ -133,7 +155,17 @@ rsync -av --exclude '._*' --exclude '.DS_Store' \
 把 coordinator 改为 B 可访问的 A 地址和空闲端口。无 SSH 时用获准离线渠道复制该文件。
 `configs/*.env` 及 `results/` 不进入 Git。
 
+**B：确认收到同一份配置。**
+
+```bash
+cd "$TEST_ROOT"
+cat configs/cpu-direct.env
+```
+
 ### 3. 两端提交预约任务
+
+保留各自第一步的 `TEST_ROOT`、`CANN_ENV`、`PYTHON_BIN` 环境变量。
+先提交 A，随即提交 B；若换终端，重新设置这三个变量。
 
 **A：**
 
@@ -153,7 +185,24 @@ task-submit --device auto --max-time 450 \
   "bash '$TEST_ROOT/scripts/cpu_direct_node.sh' 1 {} 0"
 ```
 
-两端各记下任务 ID，用 `task-submit --wait <任务ID>` 读结果。
+两端各记下本机返回的任务 ID，分别查询；不要用等待超时会取消排队任务的选项。
+
+**A：**
+
+```bash
+export A_TASK_ID=task_REPLACE_WITH_A_ID
+task-submit --status "$A_TASK_ID"
+task-submit --log "$A_TASK_ID"
+```
+
+**B：**
+
+```bash
+export B_TASK_ID=task_REPLACE_WITH_B_ID
+task-submit --status "$B_TASK_ID"
+task-submit --log "$B_TASK_ID"
+```
+
 两端实际启动应相隔少于 120 秒；排队时间过长导致连接超时，换新 run-ID 后重新预约。
 `{}` 由调度器填充预约设备，必须符合现场 ACL 逻辑 ID 规则；有可见设备重映射时按其规则修改。
 末尾 `0` 为 DRAM NUMA，应按现场替换。此任务不用 PyPTO/simpler。
@@ -176,7 +225,14 @@ source "$CANN_ENV"
 bash scripts/cpu_direct_node.sh 1 0 0
 ```
 
+直接入口中的第一个数是 rank，第二个数是**各自本机**预约 NPU 的逻辑 ID，第三个数是本机 DRAM NUMA。
+A/B 可使用不同的设备和 NUMA 编号；示例中的 `0 0` 按各自现场替换。
+无论使用哪一种启动方式，两端分别生成 `results/$RUN_ID-A/`、`results/$RUN_ID-B/`，
+均保留 `rank.log` 与 `cpu-direct.json`。超时、信号退出或普通 HAL 错误按 FAIL 保留现场，不改跑 SDMA。
+
 ### 4. 在 A 汇总两个结果目录
+
+等两端均结束后再收集，退出 3 的任务也要收集；它可能是明确不支持的完整证据。
 
 **A：**
 
@@ -193,12 +249,43 @@ collect_rc=0
 "$PYTHON_BIN" scripts/cpu_direct.py collect "$TEST_ROOT/results/$RUN_ID-A" "$B_COPY" \
   --output "$TEST_ROOT/results/$RUN_ID-summary.json" || collect_rc=$?
 printf 'collect exit=%s\n' "$collect_rc"
-cat "$TEST_ROOT/results/$RUN_ID-summary.json"
-tar -czf "$TEST_ROOT/results/$RUN_ID-evidence.tar.gz" -C "$TEST_ROOT/results" \
-  "$RUN_ID-A" "$RUN_ID-B-collected" "$RUN_ID-summary.json"
+if [[ "$collect_rc" == 0 || "$collect_rc" == 3 ]]; then
+  cat "$TEST_ROOT/results/$RUN_ID-summary.json"
+  tar -czf "$TEST_ROOT/results/$RUN_ID-evidence.tar.gz" -C "$TEST_ROOT/results" \
+    "$RUN_ID-A" "$RUN_ID-B-collected" "$RUN_ID-summary.json"
+else
+  echo 'FAIL：没有有效汇总；保留并检查 A/B 的 rank.log、cpu-direct.json 和调度日志'
+  tar -czf "$TEST_ROOT/results/$RUN_ID-evidence.tar.gz" -C "$TEST_ROOT/results" \
+    "$RUN_ID-A" "$RUN_ID-B-collected"
+fi
 ```
 
-证据文件包含 hostname 和现场路径，不直接提交公开仓库。
+双机汇总**不要添加 `--allow-single-host`**；收集器默认拒绝同机对照被算作双机结果。
+证据文件包含 hostname 和现场路径，不直接提交公开仓库。调度器完整日志也请另外保存。
+
+### 5. 核对 Host-target 和实际 CPU 读写证据
+
+**A：汇总后同时检查两端日志。**
+
+```bash
+cd "$TEST_ROOT"
+source configs/cpu-direct.env
+grep -E '^(HOSTS |HOST_IMPORT |HOST_ACCESS |CPU_IO_BEGIN |CPU_CASE_PASS |CPU_DIRECT_RESULT |CPU_DIRECT_FAIL|CPU_DIRECT_ACCESS_FAULT)' \
+  "$TEST_ROOT/results/$RUN_ID-A/rank.log" \
+  "$TEST_ROOT/results/$RUN_ID-B-collected/rank.log"
+```
+
+- 成功时，两端都必须有 `HOSTS same_host=0`、`HOST_IMPORT ... target=HOST rc=0 ready=1`、
+  `HOST_ACCESS ... set_rc=0 get_rc=0 flags=3 ready=1`，以及 `CPU_IO_BEGIN ... fallback=NONE`。
+  每端均有 actor=0/1 的 READ/WRITE 四个 `CPU_CASE_PASS` 和 `status=PASS cleanup=PASS`，退出码 0。
+  只有收集器给出 `TWO_HOST_CPU_DIRECT_PASS` 才算本轮双机 CPU 原生读写通过。
+- Host import 明确不支持时，拒绝方为 `HOST_IMPORT ... target=HOST rc=207000 ready=0`，
+  同端 HOST Set/Get 为 `-1/-1`（未调用）。即使另一端导入成功，双方也都不进入 CPU 数据阶段，
+  都应 `status=UNSUPPORTED cleanup=PASS`、退出 3；汇总为 `UNSUPPORTED`。
+- Map、权限、数据/guard、CPU fault、连接或清理异常属于 FAIL，不能改记为不支持。
+  只看到导入或 HOST 权限成功，也不能算 CPU READ/WRITE 通过。
+
+本轮关注“CPU 是否能直接读写远端 DRAM”；即使通过，也不会自动证明物理路径逐跳走 HCCS。
 
 ## 结果含义
 

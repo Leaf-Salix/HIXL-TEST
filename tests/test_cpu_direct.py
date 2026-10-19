@@ -84,6 +84,35 @@ class CpuDirectTests(unittest.TestCase):
                 self.assertEqual(result["status"], "UNSUPPORTED" if unsupported else "TWO_HOST_CPU_DIRECT_PASS")
                 self.assertEqual(result["hccs_route"], "NOT_MEASURED")
 
+    def test_two_host_import_denied_collectively_skips_cpu_io(self):
+        for denied in ((0,), (1,), (0, 1)):
+            with tempfile.TemporaryDirectory() as temp:
+                directories = self.fixtures(Path(temp), unsupported=True)
+                for rank, directory in enumerate(directories):
+                    text = log(rank, unsupported=True, local_ready=True)
+                    if rank in denied:
+                        text = text.replace("target=HOST rc=0 ready=1", "target=HOST rc=207000 ready=0")
+                        text = text.replace("set_rc=0 get_rc=0 flags=3 ready=1", "set_rc=-1 get_rc=-1 flags=0 ready=0")
+                    (directory / "rank.log").write_text(text)
+                    path = directory / "cpu-direct.json"
+                    record = json.loads(path.read_text())
+                    record.update(probe.evidence(text, rank, 0, 0, 3))
+                    probe.save(path, record)
+                result = probe.collect(directories)
+                self.assertEqual(result["status"], "UNSUPPORTED")
+                self.assertEqual(result["observed_hosts"], 2)
+                self.assertEqual([item["import_access"]["ready"] for item in result["endpoints"]],
+                                 [int(rank not in denied) for rank in (0, 1)])
+                self.assertTrue(all(not item["cases"] and item["returncode"] == 3 for item in result["endpoints"]))
+
+    def test_two_host_collect_rejects_old_device_target_log(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directories = self.fixtures(Path(temp))
+            path = directories[1] / "rank.log"
+            path.write_text(path.read_text().replace("target=HOST", "target=DEVICE"))
+            with self.assertRaises(ValueError):
+                probe.collect(directories)
+
     def test_stale_record_and_duplicate_rank_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             directories = self.fixtures(Path(temp))

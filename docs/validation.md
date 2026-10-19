@@ -11,6 +11,12 @@ DEFAULT/FABRIC 的同机角色对照均通过；正式探针不加载诊断插�
 这次修正未使用 DMA、kernel 或数据回退。跨机 Host-target 仍未验证，公开 V2 源码还有明确拒绝分支。
 根因、源码和版本边界见 [Host-target 修复记录](cpu-direct.md#2026-10-19-根因确认与-host-target-修复同机-pass)。
 
+双机入口 `scripts/cpu_direct_node.sh` 复用同一个修复后的 Host-target 探针，不使用旧 Device-target 流程。
+[A/B 完整操作命令](cpu-direct.md#两机完整命令)包含更新、重新编译、预约启动、证据收集和验收标记。
+双机汇总的离线回归覆盖单端/双端 Host import 不支持，以及旧 Device-target 日志拒收；
+这些回归不等于双机硬件验证，实际结果仍待现场运行。
+本次 51 项仓库 UT、源码/脚本检查及文档 12 段 Bash 命令语法检查通过。
+
 以下保留修复前旧 Device-target 探针的失败和排查记录，不能用作当前同机能力不支持的结论。
 
 2026-10-16，经 task-submit 预约单卡，运行两个同机进程的旧 CPU 原生访问能力探针。
